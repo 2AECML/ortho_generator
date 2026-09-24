@@ -138,6 +138,16 @@ class MainWindow(QMainWindow):
         self.image_length.setDecimals(1)
         self.image_length.setValue(20.0)
         self.image_length.setSuffix(" m")
+        self.adaptive_single_image = QCheckBox("完整单图（超限时自动调整像素大小）")
+        self.adaptive_single_image.setChecked(True)
+        self.adaptive_single_image.setToolTip(
+            "保留完整隧道范围；若整图超过像素上限，自动使用不超限的最高分辨率。"
+        )
+        self.adaptive_single_image.toggled.connect(
+            lambda checked: self.image_length.setEnabled(not checked)
+        )
+        self.image_length.setEnabled(False)
+        form.addRow("输出模式", self.adaptive_single_image)
         form.addRow("每幅大图纵向长度", self.image_length)
         self.diameter = QDoubleSpinBox()
         self.diameter.setRange(0.5, 30.0)
@@ -281,6 +291,7 @@ class MainWindow(QMainWindow):
         return GenerationSettings(
             pixel_size_m=float(self.pixel_size.currentText()) / 1000.0,
             image_length_m=self.image_length.value(),
+            adaptive_single_image=self.adaptive_single_image.isChecked(),
             expected_diameter_m=self.diameter.value(),
             auto_estimate_diameter=self.auto_diameter.isChecked(),
             vehicle_speed_mps=self.vehicle_speed.value(),
@@ -331,6 +342,7 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(f"完成：{result.output_directory}")
         self.diameter.setValue(result.estimated_diameter_m)
         self.log.appendPlainText(f"自动估算等效直径：{result.estimated_diameter_m:.3f} m")
+        self.log.appendPlainText(f"实际像素大小：{result.actual_pixel_size_m * 1000:.3f} mm")
         self.log.appendPlainText(f"正射影像：{orthophotos}")
         self.generate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
@@ -338,6 +350,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "成图完成",
             f"估算等效直径：{result.estimated_diameter_m:.3f} m\n"
+            f"实际像素大小：{result.actual_pixel_size_m * 1000:.3f} mm\n"
             f"已生成 {len(result.image_paths)} 幅正射影像。\n全部影像位于：\n{orthophotos}",
         )
 

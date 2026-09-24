@@ -12,6 +12,7 @@ from ortho_generator.las_source import LasSource
 from ortho_generator.models import PointBatch, PointCloudMetadata
 from ortho_generator.service import (
     GenerationSettings,
+    _adaptive_grid_shape,
     _antialias_foreground_edges,
     _build_display_raster,
     _build_small_hole_mask,
@@ -76,6 +77,20 @@ def test_las_quantized_y_uses_nearest_pixel_centers() -> None:
     y = np.asarray([3380.0100, 3380.0149, 3380.0199, 3380.0250])
     assert _longitudinal_columns(y, 3375.0, 0.005, True).tolist() == [1002, 1003, 1004, 1005]
     assert _longitudinal_columns(y, 3375.0, 0.005, False).tolist() == [1002, 1002, 1003, 1005]
+
+
+def test_adaptive_grid_uses_finest_complete_image_under_pixel_limit() -> None:
+    pixel_size, rows, columns = _adaptive_grid_shape(
+        circumference_m=40.0,
+        longitudinal_min_m=0.0,
+        longitudinal_max_m=100.0,
+        requested_pixel_size_m=0.005,
+        las_quantization=False,
+        maximum_pixels=80_000_000,
+    )
+    assert rows * columns <= 80_000_000
+    assert pixel_size > 0.005
+    assert np.isclose(pixel_size, 0.005 * np.sqrt(2.0), rtol=0.01)
 
 
 def test_structured_e57_uses_speed_and_revolutions_for_profile_spacing() -> None:
@@ -363,6 +378,7 @@ def test_generate_large_images_before_external_annotation(tmp_path: Path) -> Non
         GenerationSettings(
             pixel_size_m=0.1,
             image_length_m=0.6,
+            adaptive_single_image=False,
             expected_diameter_m=2.0,
             maximum_image_pixels=100_000,
             fit_sample_count=2_000,
@@ -397,6 +413,33 @@ def test_generate_large_images_before_external_annotation(tmp_path: Path) -> Non
     image_metadata = json.loads((auxiliary / "image.json").read_text(encoding="utf-8"))
     assert image_metadata["annotation_image"] == "../../orthophotos/synthetic_ORTHO_00001.png"
     assert (auxiliary / image_metadata["annotation_image"]).resolve() == first.resolve()
+
+
+def test_adaptive_output_keeps_complete_cloud_in_one_image(tmp_path: Path) -> None:
+    import json
+
+    input_path = tmp_path / "adaptive.las"
+    input_path.touch()
+    result = generate_orthophotos(
+        input_path,
+        tmp_path / "out",
+        GenerationSettings(
+            pixel_size_m=0.1,
+            expected_diameter_m=2.0,
+            maximum_image_pixels=500,
+            fit_sample_count=2_000,
+        ),
+        source_factory=SyntheticSource,
+    )
+    assert len(result.image_paths) == 1
+    assert result.resolution_adjusted
+    assert result.actual_pixel_size_m > 0.1
+    with Image.open(result.image_paths[0]) as image:
+        assert image.width * image.height <= 500
+    manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["output_layout"]["mode"] == "adaptive_single_image"
+    assert manifest["grid"]["resolution_adjusted"] is True
+    assert manifest["grid"]["pixel_size_m"] == result.actual_pixel_size_m
 
 
 class SourceWithGrossOutlier(SyntheticSource):

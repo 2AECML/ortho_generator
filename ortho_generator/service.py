@@ -26,6 +26,7 @@ Progress = Callable[[str, int], None]
 class GenerationSettings:
     pixel_size_m: float = 0.005
     image_length_m: float = 20.0
+    adaptive_single_image: bool = True
     expected_diameter_m: float = 5.4
     auto_estimate_diameter: bool = True
     vehicle_speed_mps: float = 0.4
@@ -95,6 +96,83 @@ class GenerationResult:
     manifest_path: str
     image_paths: tuple[str, ...]
     estimated_diameter_m: float
+    actual_pixel_size_m: float
+    resolution_adjusted: bool
+
+
+def _grid_shape(
+    circumference_m: float,
+    longitudinal_min_m: float,
+    longitudinal_max_m: float,
+    pixel_size_m: float,
+    las_quantization: bool,
+) -> tuple[int, int]:
+    rows = int(np.ceil(circumference_m / pixel_size_m))
+    columns = int(
+        _longitudinal_columns(
+            np.asarray([longitudinal_max_m]),
+            longitudinal_min_m,
+            pixel_size_m,
+            las_quantization,
+        )[0]
+    ) + 1
+    return rows, columns
+
+
+def _adaptive_grid_shape(
+    circumference_m: float,
+    longitudinal_min_m: float,
+    longitudinal_max_m: float,
+    requested_pixel_size_m: float,
+    las_quantization: bool,
+    maximum_pixels: int,
+) -> tuple[float, int, int]:
+    """Use the finest uniform resolution whose complete image fits the limit."""
+    requested_shape = _grid_shape(
+        circumference_m,
+        longitudinal_min_m,
+        longitudinal_max_m,
+        requested_pixel_size_m,
+        las_quantization,
+    )
+    requested_pixels = requested_shape[0] * requested_shape[1]
+    if requested_pixels <= maximum_pixels:
+        return requested_pixel_size_m, *requested_shape
+
+    lower = requested_pixel_size_m
+    upper = requested_pixel_size_m * np.sqrt(requested_pixels / maximum_pixels)
+    while True:
+        upper_shape = _grid_shape(
+            circumference_m,
+            longitudinal_min_m,
+            longitudinal_max_m,
+            upper,
+            las_quantization,
+        )
+        if upper_shape[0] * upper_shape[1] <= maximum_pixels:
+            break
+        upper *= 1.01
+    for _ in range(64):
+        middle = (lower + upper) / 2.0
+        shape = _grid_shape(
+            circumference_m,
+            longitudinal_min_m,
+            longitudinal_max_m,
+            middle,
+            las_quantization,
+        )
+        if shape[0] * shape[1] <= maximum_pixels:
+            upper = middle
+        else:
+            lower = middle
+    rows, columns = _grid_shape(
+        circumference_m,
+        longitudinal_min_m,
+        longitudinal_max_m,
+        upper,
+        las_quantization,
+    )
+    return float(upper), rows, columns
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -638,14 +716,37 @@ def generate_orthophotos(
                 metadata.scan_rows,
                 arc,
             )
-        row_count = int(np.ceil(arc.circumference / cfg.pixel_size_m))
-        column_count = int(_longitudinal_columns(np.asarray([y_max]), y_min, cfg.pixel_size_m, is_las)[0]) + 1
-        image_columns = max(1, int(round(cfg.image_length_m / cfg.pixel_size_m)))
-        image_columns = min(image_columns, column_count)
-        if row_count * image_columns > cfg.maximum_image_pixels:
-            raise ValueError(
-                f"单幅图约 {row_count * image_columns:,} 像素，超过上限 "
-                f"{cfg.maximum_image_pixels:,}；请缩短大图长度或增大像素尺寸。"
+        requested_row_count, requested_column_count = _grid_shape(
+            arc.circumference, y_min, y_max, cfg.pixel_size_m, is_las
+        )
+        if cfg.adaptive_single_image:
+            effective_pixel_size_m, row_count, column_count = _adaptive_grid_shape(
+                arc.circumference,
+                y_min,
+                y_max,
+                cfg.pixel_size_m,
+                is_las,
+                cfg.maximum_image_pixels,
+            )
+            image_columns = column_count
+        else:
+            effective_pixel_size_m = cfg.pixel_size_m
+            row_count, column_count = requested_row_count, requested_column_count
+            image_columns = max(1, int(round(cfg.image_length_m / effective_pixel_size_m)))
+            image_columns = min(image_columns, column_count)
+            if row_count * image_columns > cfg.maximum_image_pixels:
+                raise ValueError(
+                    f"单幅图约 {row_count * image_columns:,} 像素，超过上限 "
+                    f"{cfg.maximum_image_pixels:,}；请缩短大图长度或增大像素尺寸。"
+                )
+        resolution_adjusted = effective_pixel_size_m > cfg.pixel_size_m * (1.0 + 1e-12)
+        if resolution_adjusted:
+            emit(
+                f"整图预计 {requested_row_count * requested_column_count:,} 像素，"
+                f"超过上限 {cfg.maximum_image_pixels:,}；像素大小由 "
+                f"{cfg.pixel_size_m * 1000:.3f} mm 自动调整为 "
+                f"{effective_pixel_size_m * 1000:.3f} mm。",
+                41,
             )
         total_pixels = row_count * column_count
         required_bytes = total_pixels * (48 if depth_display else 20) + 100 * 1024 * 1024
@@ -696,7 +797,12 @@ def generate_orthophotos(
             ellipse=ellipse.to_dict(),
             ellipse_fit=fit_report,
             grid={
-                "pixel_size_m": cfg.pixel_size_m,
+                "requested_pixel_size_m": cfg.pixel_size_m,
+                "pixel_size_m": effective_pixel_size_m,
+                "resolution_adjusted": resolution_adjusted,
+                "resolution_scale": effective_pixel_size_m / cfg.pixel_size_m,
+                "requested_row_count": requested_row_count,
+                "requested_column_count": requested_column_count,
                 "vehicle_speed_mps": cfg.vehicle_speed_mps,
                 "scanner_revolutions_per_second": cfg.scanner_revolutions_per_second,
                 "scan_profile_spacing_m": cfg.scan_profile_spacing_m,
@@ -720,6 +826,7 @@ def generate_orthophotos(
             },
             display={"method": display_method, "minimum": display_min, "maximum": display_max},
             output_layout={
+                "mode": "adaptive_single_image" if cfg.adaptive_single_image else "fixed_resolution_tiles",
                 "orthophoto_directory": "orthophotos",
                 "auxiliary_directory": "auxiliary",
                 "orthophoto_pattern": f"{input_file.stem}_ORTHO_{{sequence:05d}}.png",
@@ -754,10 +861,10 @@ def generate_orthophotos(
                     row_arc[valid_source_rows] = structured_row_lookup[
                         source_rows[valid_source_rows]
                     ]
-                    rows = np.floor(row_arc / cfg.pixel_size_m).astype(np.int64)
+                    rows = np.floor(row_arc / effective_pixel_size_m).astype(np.int64)
                 else:
-                    rows = np.floor(arc.project(x, z) / cfg.pixel_size_m).astype(np.int64)
-                columns = _longitudinal_columns(y, y_min, cfg.pixel_size_m, is_las)
+                    rows = np.floor(arc.project(x, z) / effective_pixel_size_m).astype(np.int64)
+                columns = _longitudinal_columns(y, y_min, effective_pixel_size_m, is_las)
                 depths = ellipse.signed_relative_depth(x, z) if depth_display else None
                 valid = (
                     (rows >= 0)
@@ -809,8 +916,8 @@ def generate_orthophotos(
                 )
                 y = longitudinal[selected]
                 depths = ellipse.signed_relative_depth(x, z)
-                rows = np.floor(arc.project(x, z) / cfg.pixel_size_m).astype(np.int64)
-                columns = _longitudinal_columns(y, y_min, cfg.pixel_size_m, True)
+                rows = np.floor(arc.project(x, z) / effective_pixel_size_m).astype(np.int64)
+                columns = _longitudinal_columns(y, y_min, effective_pixel_size_m, True)
                 in_grid = (rows >= 0) & (rows < row_count) & (columns >= 0) & (columns < column_count)
                 eligible = in_grid & np.isfinite(depths) & (np.abs(depths) <= cfg.maximum_las_display_relative_depth_m)
                 display_rejected_points += int(np.count_nonzero(in_grid & ~eligible))
@@ -875,7 +982,7 @@ def generate_orthophotos(
             interpolation = _build_small_hole_mask(
                 display_hits,
                 interpolation_path,
-                cfg.pixel_size_m,
+                effective_pixel_size_m,
                 cfg.maximum_display_interpolation_distance_m,
                 token,
                 allow_scanline_gaps=is_las or metadata.structured_indices,
@@ -887,7 +994,7 @@ def generate_orthophotos(
                 display_field,
                 interpolation,
                 (display_min, display_max),
-                cfg.pixel_size_m,
+                effective_pixel_size_m,
                 cfg.maximum_display_interpolation_distance_m,
                 token,
                 cfg.suppress_display_impulses,
@@ -911,7 +1018,7 @@ def generate_orthophotos(
                 tile=(256, 256),
                 compression=None,
                 photometric="minisblack",
-                metadata={"axes": "YX", "unit": "source intensity", "pixel_size_m": cfg.pixel_size_m},
+                metadata={"axes": "YX", "unit": "source intensity", "pixel_size_m": effective_pixel_size_m},
             )
             annotation_name = f"{input_file.stem}_{image_id}.png"
             image_path = orthophoto_directory / annotation_name
@@ -929,9 +1036,10 @@ def generate_orthophotos(
                 "sequence_count": len(specs),
                 "source_point_cloud": str(input_file),
                 "shape": list(shape),
-                "pixel_size_m": cfg.pixel_size_m,
+                "requested_pixel_size_m": cfg.pixel_size_m,
+                "pixel_size_m": effective_pixel_size_m,
                 "global_window": {"row0": 0, "row1": row_count, "column0": column0, "column1": column1},
-                "longitudinal_bounds_m": [y_min + column0 * cfg.pixel_size_m, y_min + (column1 - 1) * cfg.pixel_size_m],
+                "longitudinal_bounds_m": [y_min + column0 * effective_pixel_size_m, y_min + (column1 - 1) * effective_pixel_size_m],
                 "image": Path(os.path.relpath(image_path, directory)).as_posix(),
                 "annotation_image": Path(os.path.relpath(image_path, directory)).as_posix(),
                 "scientific_tiff": tiff_path.name,
@@ -999,7 +1107,12 @@ def generate_orthophotos(
         _atomic_json(manifest_path, state)
         emit(f"完成：生成 {len(image_paths)} 幅大图", 100)
         return GenerationResult(
-            str(run_directory), str(manifest_path), tuple(image_paths), estimated_diameter
+            str(run_directory),
+            str(manifest_path),
+            tuple(image_paths),
+            estimated_diameter,
+            effective_pixel_size_m,
+            resolution_adjusted,
         )
     except Exception as error:
         state.update(
