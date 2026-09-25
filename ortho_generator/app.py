@@ -5,13 +5,14 @@ import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -22,6 +23,8 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -138,7 +141,8 @@ class MainWindow(QMainWindow):
         self.worker: GenerationWorker | None = None
         self.last_output: str | None = None
         self.setWindowTitle("隧道点云大幅正射成图")
-        self.resize(900, 680)
+        self.setMinimumSize(680, 480)
+        self.resize(920, 700)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -147,7 +151,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         title = QLabel("LAS / E57 → 隧道大幅正射影像")
-        title.setStyleSheet("font-size: 22px; font-weight: 600;")
+        title.setStyleSheet("font-size: 20px; font-weight: 600;")
         layout.addWidget(title)
         note = QLabel(
             "本程序只负责大图成图，不包含标注、复核或 640×640 切片。"
@@ -157,17 +161,27 @@ class MainWindow(QMainWindow):
         note.setWordWrap(True)
         layout.addWidget(note)
 
+        settings_scroll = QScrollArea()
+        settings_scroll.setObjectName("settingsScroll")
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.NoFrame)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        settings_scroll.setMinimumHeight(220)
+        settings_content = QWidget()
+        settings_layout = QVBoxLayout(settings_content)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+
         source_box = QGroupBox("输入与输出")
         source_form = QFormLayout(source_box)
         self.source_edit = QPlainTextEdit()
-        self.source_edit.setMaximumHeight(82)
+        self.source_edit.setMaximumHeight(64)
         self.source_edit.setPlaceholderText("每行一个 LAS/E57 文件")
         source_row = QHBoxLayout()
         source_row.addWidget(self.source_edit, 1)
-        choose_source = QPushButton("选择 LAS/E57（可多选）…")
+        choose_source = QPushButton("选择文件…")
         choose_source.clicked.connect(self._choose_source)
         source_row.addWidget(choose_source)
-        inspect_button = QPushButton("检查输入")
+        inspect_button = QPushButton("检查")
         inspect_button.clicked.connect(self._inspect_source)
         source_row.addWidget(inspect_button)
         source_form.addRow("点云文件", source_row)
@@ -198,10 +212,12 @@ class MainWindow(QMainWindow):
         self.source_info = QLabel("尚未检查输入。")
         self.source_info.setWordWrap(True)
         source_form.addRow("输入信息", self.source_info)
-        layout.addWidget(source_box)
+        settings_layout.addWidget(source_box)
 
-        parameters = QGroupBox("成图参数")
-        form = QFormLayout(parameters)
+        parameters = QTabWidget()
+        parameters.setObjectName("parameterTabs")
+        basic_page = QWidget()
+        form = QFormLayout(basic_page)
         self.pixel_size = QComboBox()
         self.pixel_size.setEditable(True)
         self.pixel_size.addItems(["5.0", "2.5", "1.5"])
@@ -243,7 +259,7 @@ class MainWindow(QMainWindow):
         self.image_length.setDecimals(1)
         self.image_length.setValue(20.0)
         self.image_length.setSuffix(" m")
-        self.adaptive_single_image = QCheckBox("完整单图（超限时自动调整像素大小）")
+        self.adaptive_single_image = QCheckBox("完整单图（超限自动降低分辨率）")
         self.adaptive_single_image.setChecked(True)
         self.adaptive_single_image.setToolTip(
             "保留完整隧道范围；若整图超过像素上限，自动使用不超限的最高分辨率。"
@@ -278,8 +294,10 @@ class MainWindow(QMainWindow):
         self.display_max = QLineEdit()
         self.display_min.setPlaceholderText("留空自动使用 1% 分位")
         self.display_max.setPlaceholderText("留空自动使用 99% 分位")
-        form.addRow("显示强度下限", self.display_min)
-        form.addRow("显示强度上限", self.display_max)
+        display_page = QWidget()
+        display_form = QFormLayout(display_page)
+        display_form.addRow("显示强度下限", self.display_min)
+        display_form.addRow("显示强度上限", self.display_max)
         self.interpolation_distance = QDoubleSpinBox()
         self.interpolation_distance.setRange(0.0, 100.0)
         self.interpolation_distance.setDecimals(1)
@@ -288,37 +306,46 @@ class MainWindow(QMainWindow):
         self.interpolation_distance.setToolTip(
             "只填补封闭小孔；0 表示关闭。科学强度与观测掩膜始终不修改。"
         )
-        form.addRow("显示小孔最大插值距离", self.interpolation_distance)
-        self.suppress_impulses = QCheckBox("抑制显示图中的孤立亮点和黑点")
+        display_form.addRow("显示小孔最大插值距离", self.interpolation_distance)
+        self.suppress_impulses = QCheckBox("抑制显示图中的孤立亮点/黑点")
         self.suppress_impulses.setChecked(True)
         self.suppress_impulses.setToolTip(
             "只修正显示 PNG 中孤立的单像素脉冲；科学强度、TIFF 与观测掩膜不修改。"
         )
-        form.addRow("显示杂点处理", self.suppress_impulses)
-        self.las_depth_display = QCheckBox("LAS 显示图启用前景深度簇聚合（科学数据保留）")
+        display_form.addRow("显示杂点处理", self.suppress_impulses)
+        self.las_depth_display = QCheckBox("启用 LAS 前景深度簇聚合")
         self.las_depth_display.setChecked(True)
-        form.addRow("LAS 管线边缘处理", self.las_depth_display)
+        self.las_depth_display.setToolTip(
+            "仅调整显示 PNG 的前景深度聚合，科学数据保持不变。"
+        )
+        display_form.addRow("LAS 管线边缘处理", self.las_depth_display)
         self.las_max_depth = QDoubleSpinBox()
         self.las_max_depth.setRange(0.1, 20.0)
         self.las_max_depth.setValue(2.0)
         self.las_max_depth.setSuffix(" m")
-        form.addRow("LAS 显示最大相对深度", self.las_max_depth)
+        display_form.addRow("LAS 显示最大相对深度", self.las_max_depth)
         self.las_cluster = QDoubleSpinBox()
         self.las_cluster.setRange(1.0, 500.0)
         self.las_cluster.setValue(30.0)
         self.las_cluster.setSuffix(" mm")
-        form.addRow("LAS 前景深度簇厚度", self.las_cluster)
+        display_form.addRow("LAS 前景深度簇厚度", self.las_cluster)
         self.las_antialias = QDoubleSpinBox()
         self.las_antialias.setRange(0.0, 1.0)
         self.las_antialias.setSingleStep(0.1)
         self.las_antialias.setValue(0.5)
         self.las_antialias.setToolTip("仅在前景深度边缘沿轮廓做亚像素采样；0 关闭。不是缺测重建，科学数据不修改。需启用 LAS 深度簇聚合。")
-        form.addRow("LAS 轮廓抗锯齿强度", self.las_antialias)
-        self.coordinate_confirmed = QCheckBox(
-            "已确认 X/Z 为断面横向/竖向；LAS 或普通 E57 的 Y 为纵向米制坐标"
+        display_form.addRow("LAS 轮廓抗锯齿强度", self.las_antialias)
+        self.coordinate_confirmed = QCheckBox("已确认点云坐标方向符合要求")
+        self.coordinate_confirmed.setToolTip(
+            "X/Z 为断面横向/竖向；LAS 或普通 E57 的 Y 为纵向米制坐标。"
         )
         form.addRow("坐标确认", self.coordinate_confirmed)
-        layout.addWidget(parameters)
+        parameters.addTab(basic_page, "基础与几何")
+        parameters.addTab(display_page, "显示与 LAS 处理")
+        settings_layout.addWidget(parameters)
+        settings_layout.addStretch(1)
+        settings_scroll.setWidget(settings_content)
+        layout.addWidget(settings_scroll, 3)
 
         action_row = QHBoxLayout()
         self.generate_button = QPushButton("生成大幅正射影像")
@@ -339,6 +366,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMinimumHeight(80)
         layout.addWidget(self.log, 1)
 
     def _choose_source(self) -> None:
