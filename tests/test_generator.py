@@ -457,6 +457,8 @@ def test_generate_large_images_before_external_annotation(tmp_path: Path) -> Non
             pixel_size_m=0.1,
             image_length_m=0.6,
             adaptive_single_image=False,
+            output_auxiliary_data=True,
+            flat_image_output=False,
             expected_diameter_m=2.0,
             maximum_image_pixels=100_000,
             fit_sample_count=2_000,
@@ -510,14 +512,49 @@ def test_adaptive_output_keeps_complete_cloud_in_one_image(tmp_path: Path) -> No
         source_factory=SyntheticSource,
     )
     assert len(result.image_paths) == 1
+    image_path = Path(result.image_paths[0])
+    assert image_path.parent == (tmp_path / "out").resolve()
+    assert not any(path.is_dir() for path in (tmp_path / "out").iterdir())
+    assert Path(result.manifest_path).name == f"manifest_{image_path.stem}.json"
     assert result.resolution_adjusted
     assert result.actual_pixel_size_m > 0.1
     with Image.open(result.image_paths[0]) as image:
         assert image.width * image.height <= 500
     manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["primary_image"] == image_path.name
+    assert manifest["output_layout"]["flat_image_output"] is True
+    assert manifest["output_layout"]["auxiliary_directory"] is None
     assert manifest["output_layout"]["mode"] == "adaptive_single_image"
     assert manifest["grid"]["resolution_adjusted"] is True
     assert manifest["grid"]["pixel_size_m"] == result.actual_pixel_size_m
+
+
+def test_nonflat_output_without_auxiliary_keeps_only_images_and_manifest(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "nonflat.las"
+    input_path.touch()
+    result = generate_orthophotos(
+        input_path,
+        tmp_path / "out",
+        GenerationSettings(
+            pixel_size_m=0.1,
+            expected_diameter_m=2.0,
+            output_auxiliary_data=False,
+            flat_image_output=False,
+            maximum_image_pixels=100_000,
+            fit_sample_count=2_000,
+        ),
+        source_factory=SyntheticSource,
+    )
+    output_directory = Path(result.output_directory)
+    assert Path(result.manifest_path) == output_directory / "manifest.json"
+    assert (output_directory / "orthophotos").is_dir()
+    assert not (output_directory / "auxiliary").exists()
+    assert all(
+        Path(image_path).parent == output_directory / "orthophotos"
+        for image_path in result.image_paths
+    )
 
 
 class SourceWithGrossOutlier(SyntheticSource):
@@ -535,6 +572,7 @@ def test_depth_display_preserves_scientific_outlier_and_support(tmp_path: Path) 
     result = generate_orthophotos(
         input_path, tmp_path / "out",
         GenerationSettings(pixel_size_m=0.1, image_length_m=2.0,
+                           output_auxiliary_data=True, flat_image_output=False,
                            expected_diameter_m=2.0, fit_sample_count=2000),
         source_factory=SourceWithGrossOutlier,
     )
@@ -563,6 +601,7 @@ def test_pipe_foreground_not_averaged_with_background(tmp_path: Path) -> None:
     result = generate_orthophotos(
         path, tmp_path / "out",
         GenerationSettings(pixel_size_m=0.1, image_length_m=2,
+                           output_auxiliary_data=True, flat_image_output=False,
                            expected_diameter_m=2, fit_sample_count=2000),
         source_factory=SourceWithPipe,
     )
@@ -616,6 +655,7 @@ def test_rebuild_reproduces_las_display_sidecars_without_scientific_edits(tmp_pa
     result = generate_orthophotos(
         path, tmp_path / "out",
         GenerationSettings(pixel_size_m=0.1, image_length_m=2,
+                           output_auxiliary_data=True, flat_image_output=False,
                            expected_diameter_m=2, fit_sample_count=2000),
         source_factory=SourceWithPipe,
     )

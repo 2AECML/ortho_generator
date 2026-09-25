@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 from typing import Callable
 
 import numpy as np
@@ -39,6 +40,8 @@ class GenerationSettings:
     pixel_size_m: float = 0.005
     image_length_m: float = 20.0
     adaptive_single_image: bool = True
+    output_auxiliary_data: bool = False
+    flat_image_output: bool = True
     expected_diameter_m: float = 5.4
     auto_estimate_diameter: bool = True
     vehicle_speed_mps: float = 0.4
@@ -63,6 +66,8 @@ class GenerationSettings:
         return self.vehicle_speed_mps / self.scanner_revolutions_per_second
 
     def validate(self) -> None:
+        if self.output_auxiliary_data and self.flat_image_output:
+            raise ValueError("输出辅助数据时不能开启影像集中存放。")
         if not np.isfinite(self.vehicle_speed_mps) or self.vehicle_speed_mps <= 0:
             raise ValueError("小车速度必须为有限正数。")
         if (
@@ -117,11 +122,25 @@ class GenerationSettings:
 @dataclass(frozen=True, slots=True)
 class GenerationResult:
     output_directory: str
-    manifest_path: str
+    manifest_path: str | None
     image_paths: tuple[str, ...]
     estimated_diameter_m: float
     actual_pixel_size_m: float
     resolution_adjusted: bool
+
+
+def _available_image_path(directory: Path, filename: str) -> Path:
+    """返回不覆盖已有文件的影像路径。"""
+    candidate = directory / filename
+    if not candidate.exists():
+        return candidate
+    path = Path(filename)
+    index = 2
+    while True:
+        candidate = directory / f"{path.stem}_{index}{path.suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def scanner_description_path(point_cloud_path: str | Path) -> Path:
@@ -698,9 +717,32 @@ def generate_orthophotos(
     output_root = Path(output_parent).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     run_name = f"{input_file.stem}_{datetime.now():%Y%m%d_%H%M%S_%f}"
-    run_directory = output_root / run_name
-    run_directory.mkdir(parents=False, exist_ok=False)
-    manifest_path = run_directory / "manifest.json"
+    temporary_workspace: tempfile.TemporaryDirectory[str] | None = None
+    if cfg.flat_image_output:
+        temporary_workspace = tempfile.TemporaryDirectory(
+            prefix=".easytry_ortho_", dir=output_root
+        )
+        work_directory = Path(temporary_workspace.name)
+        result_directory = output_root
+        orthophoto_directory = output_root
+        auxiliary_root = work_directory / "work"
+        manifest_path = work_directory / "manifest.json"
+    else:
+        result_directory = output_root / run_name
+        result_directory.mkdir(parents=False, exist_ok=False)
+        orthophoto_directory = result_directory / "orthophotos"
+        if cfg.output_auxiliary_data:
+            work_directory = result_directory
+            auxiliary_root = result_directory / "auxiliary"
+        else:
+            temporary_workspace = tempfile.TemporaryDirectory(
+                prefix=".easytry_ortho_", dir=result_directory
+            )
+            work_directory = Path(temporary_workspace.name)
+            auxiliary_root = work_directory / "work"
+        manifest_path = result_directory / "manifest.json"
+    orthophoto_directory.mkdir(parents=True, exist_ok=True)
+    auxiliary_root.mkdir(parents=True, exist_ok=True)
     state = {
         "schema_version": "tunnel-ortho-large-image-v1",
         "status": "RUNNING",
@@ -877,7 +919,8 @@ def generate_orthophotos(
             )
         total_pixels = row_count * column_count
         required_bytes = total_pixels * (48 if depth_display else 20) + 100 * 1024 * 1024
-        if shutil.disk_usage(output_root).free < required_bytes:
+        storage_root = output_root if cfg.output_auxiliary_data else work_directory
+        if shutil.disk_usage(storage_root).free < required_bytes:
             raise ValueError(f"磁盘空间不足，预计至少需要 {required_bytes / 1024**3:.2f} GB。")
 
         if cfg.display_min is None:
@@ -892,10 +935,6 @@ def generate_orthophotos(
             display_method = "user_fixed"
 
         specs = []
-        orthophoto_directory = run_directory / "orthophotos"
-        auxiliary_root = run_directory / "auxiliary"
-        orthophoto_directory.mkdir()
-        auxiliary_root.mkdir()
         for index, column0 in enumerate(range(0, column_count, image_columns), start=1):
             column1 = min(column_count, column0 + image_columns)
             image_id = f"ORTHO_{index:05d}"
@@ -959,8 +998,10 @@ def generate_orthophotos(
             display={"method": display_method, "minimum": display_min, "maximum": display_max},
             output_layout={
                 "mode": "adaptive_single_image" if cfg.adaptive_single_image else "fixed_resolution_tiles",
-                "orthophoto_directory": "orthophotos",
-                "auxiliary_directory": "auxiliary",
+                "orthophoto_directory": "." if cfg.flat_image_output else "orthophotos",
+                "auxiliary_directory": "auxiliary" if cfg.output_auxiliary_data else None,
+                "output_auxiliary_data": cfg.output_auxiliary_data,
+                "flat_image_output": cfg.flat_image_output,
                 "orthophoto_pattern": f"{input_file.stem}_ORTHO_{{sequence:05d}}.png",
             },
         )
@@ -1139,28 +1180,35 @@ def generate_orthophotos(
                     cfg.las_edge_antialias_strength,
                 )
                 antialias_pixels = int(np.count_nonzero(antialias_mask))
-                Image.fromarray(antialias_mask).save(directory / "display_antialias_mask.png")
+                if cfg.output_auxiliary_data:
+                    Image.fromarray(antialias_mask).save(directory / "display_antialias_mask.png")
             if display_front_depth is not None:
                 _close(display_front_depth)
             tiff_path = directory / "intensity.tif"
-            tifffile.imwrite(
-                tiff_path,
-                raw,
-                bigtiff=raw.nbytes >= 3_500_000_000,
-                tile=(256, 256),
-                compression=None,
-                photometric="minisblack",
-                metadata={"axes": "YX", "unit": "source intensity", "pixel_size_m": effective_pixel_size_m},
-            )
+            if cfg.output_auxiliary_data:
+                tifffile.imwrite(
+                    tiff_path,
+                    raw,
+                    bigtiff=raw.nbytes >= 3_500_000_000,
+                    tile=(256, 256),
+                    compression=None,
+                    photometric="minisblack",
+                    metadata={"axes": "YX", "unit": "source intensity", "pixel_size_m": effective_pixel_size_m},
+                )
             annotation_name = f"{input_file.stem}_{image_id}.png"
-            image_path = orthophoto_directory / annotation_name
-            Image.fromarray(display).save(image_path)
-            Image.fromarray(observed).save(directory / "observed_mask.png")
-            if depth_display:
-                Image.fromarray((display_hits > 0).astype(np.uint8)).save(directory / "display_support_mask.png")
-            Image.fromarray(np.asarray(interpolation)).save(
-                directory / "interpolated_mask.png"
+            image_path = (
+                _available_image_path(orthophoto_directory, annotation_name)
+                if cfg.flat_image_output
+                else orthophoto_directory / annotation_name
             )
+            Image.fromarray(display).save(image_path)
+            if cfg.output_auxiliary_data:
+                Image.fromarray(observed).save(directory / "observed_mask.png")
+                if depth_display:
+                    Image.fromarray((display_hits > 0).astype(np.uint8)).save(directory / "display_support_mask.png")
+                Image.fromarray(np.asarray(interpolation)).save(
+                    directory / "interpolated_mask.png"
+                )
             image_metadata = {
                 "schema_version": "tunnel-ortho-image-v1",
                 "image_id": image_id,
@@ -1213,7 +1261,8 @@ def generate_orthophotos(
                 image_metadata["display_support_mask"] = "display_support_mask.png"
                 image_metadata["display_hit_count"] = "display_hit_count.npy"
                 image_metadata["display_front_depth"] = "display_front_depth.npy"
-            _atomic_json(directory / "image.json", image_metadata)
+            if cfg.output_auxiliary_data:
+                _atomic_json(directory / "image.json", image_metadata)
             _close(raw)
             _close(sums)
             _close(hits)
@@ -1221,11 +1270,12 @@ def generate_orthophotos(
             if depth_display:
                 _close(display_field)
                 _close(display_hits)
-                (directory / "_depth_max.npy").replace(directory / "display_front_depth.npy")
-                (directory / "_display_sum.npy").unlink()
+                if cfg.output_auxiliary_data:
+                    (directory / "_depth_max.npy").replace(directory / "display_front_depth.npy")
+                    (directory / "_display_sum.npy").unlink()
             (directory / "_sum.npy").unlink()
             interpolation_path.unlink()
-            relative_image = image_path.relative_to(run_directory).as_posix()
+            relative_image = image_path.relative_to(result_directory).as_posix()
             state["images"].append(relative_image)
             image_paths.append(str(image_path.resolve()))
             _atomic_json(manifest_path, state)
@@ -1236,11 +1286,26 @@ def generate_orthophotos(
             display_interpolated_pixel_count=total_interpolated_pixels,
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
-        _atomic_json(manifest_path, state)
+        result_manifest_path: Path | None
+        if cfg.flat_image_output:
+            result_manifest_path = None
+            for image_path_text in image_paths:
+                image_path = Path(image_path_text)
+                image_manifest_path = image_path.with_name(
+                    f"manifest_{image_path.stem}.json"
+                )
+                image_state = dict(state)
+                image_state["primary_image"] = image_path.name
+                _atomic_json(image_manifest_path, image_state)
+                if result_manifest_path is None:
+                    result_manifest_path = image_manifest_path
+        else:
+            _atomic_json(manifest_path, state)
+            result_manifest_path = manifest_path
         emit(f"完成：生成 {len(image_paths)} 幅大图", 100)
         return GenerationResult(
-            str(run_directory),
-            str(manifest_path),
+            str(result_directory),
+            str(result_manifest_path) if result_manifest_path is not None else None,
             tuple(image_paths),
             estimated_diameter,
             effective_pixel_size_m,
@@ -1257,3 +1322,8 @@ def generate_orthophotos(
     finally:
         if source is not None:
             source.close()
+        if temporary_workspace is not None:
+            try:
+                temporary_workspace.cleanup()
+            except OSError:
+                pass

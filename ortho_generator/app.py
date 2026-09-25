@@ -179,6 +179,22 @@ class MainWindow(QMainWindow):
         choose_output.clicked.connect(self._choose_output)
         output_row.addWidget(choose_output)
         source_form.addRow("输出父目录", output_row)
+        self.output_auxiliary_data = QCheckBox("输出辅助数据")
+        self.output_auxiliary_data.setChecked(False)
+        self.output_auxiliary_data.setToolTip(
+            "保留科学强度、掩膜、点击计数和每幅图的详细元数据。"
+        )
+        source_form.addRow("辅助输出", self.output_auxiliary_data)
+        self.flat_image_output = QCheckBox("集中存放影像")
+        self.flat_image_output.setChecked(True)
+        self.flat_image_output.setToolTip(
+            "将影像及其 manifest_"
+            "{影像名}.json 直接存放到选定的输出目录。"
+        )
+        self.output_auxiliary_data.toggled.connect(
+            self._output_auxiliary_data_toggled
+        )
+        source_form.addRow("影像存放", self.flat_image_output)
         self.source_info = QLabel("尚未检查输入。")
         self.source_info.setWordWrap(True)
         source_form.addRow("输入信息", self.source_info)
@@ -207,7 +223,8 @@ class MainWindow(QMainWindow):
         self.scanner_revolutions.setToolTip("扫描仪每秒完成的断面扫描圈数。")
         form.addRow("扫描仪每秒圈数", self.scanner_revolutions)
         self.auto_scanner_revolutions = QCheckBox("根据扫描说明自动设定")
-        self.auto_scanner_revolutions.setChecked(False)
+        self.auto_scanner_revolutions.setChecked(True)
+        self.scanner_revolutions.setEnabled(False)
         self.auto_scanner_revolutions.setToolTip(
             "从每个点云同目录的“文件名_扫描说明.txt”读取并四舍五入；"
             "批量处理时每个文件分别设定。"
@@ -390,6 +407,11 @@ class MainWindow(QMainWindow):
         if checked:
             self._sync_scanner_revolutions(show_errors=True)
 
+    def _output_auxiliary_data_toggled(self, checked: bool) -> None:
+        if checked:
+            self.flat_image_output.setChecked(False)
+        self.flat_image_output.setEnabled(not checked)
+
     def _sync_scanner_revolutions(self, show_errors: bool) -> None:
         paths = self._source_paths()
         if not paths:
@@ -428,6 +450,8 @@ class MainWindow(QMainWindow):
             pixel_size_m=float(self.pixel_size.currentText()) / 1000.0,
             image_length_m=self.image_length.value(),
             adaptive_single_image=self.adaptive_single_image.isChecked(),
+            output_auxiliary_data=self.output_auxiliary_data.isChecked(),
+            flat_image_output=self.flat_image_output.isChecked(),
             expected_diameter_m=self.diameter.value(),
             auto_estimate_diameter=self.auto_diameter.isChecked(),
             vehicle_speed_mps=self.vehicle_speed.value(),
@@ -490,9 +514,15 @@ class MainWindow(QMainWindow):
         self.last_output = summary.output_parent
         total_images = 0
         for source, result in summary.results:
-            orthophotos = Path(result.output_directory) / "orthophotos"
             total_images += len(result.image_paths)
-            self.log.appendPlainText(f"完成 {Path(source).name}：{orthophotos}")
+            image_directory = (
+                Path(result.image_paths[0]).parent
+                if result.image_paths
+                else Path(result.output_directory)
+            )
+            self.log.appendPlainText(f"完成 {Path(source).name}：{image_directory}")
+            if result.manifest_path is not None:
+                self.log.appendPlainText(f"  清单：{result.manifest_path}")
             self.log.appendPlainText(
                 f"  等效直径 {result.estimated_diameter_m:.3f} m | "
                 f"实际像素 {result.actual_pixel_size_m * 1000:.3f} mm"
