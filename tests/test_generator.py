@@ -21,6 +21,8 @@ from ortho_generator.service import (
     _longitudinal_columns,
     _longitudinal_positions,
     generate_orthophotos,
+    read_scanner_revolutions,
+    scanner_description_path,
 )
 
 
@@ -91,6 +93,71 @@ def test_adaptive_grid_uses_finest_complete_image_under_pixel_limit() -> None:
     assert rows * columns <= 80_000_000
     assert pixel_size > 0.005
     assert np.isclose(pixel_size, 0.005 * np.sqrt(2.0), rtol=0.01)
+
+
+def test_scanner_revolutions_are_read_and_rounded_half_up(tmp_path: Path) -> None:
+    point_cloud = tmp_path / "bdlsx1001.e57"
+    point_cloud.touch()
+    description = scanner_description_path(point_cloud)
+    description.write_text(
+        "其他说明\n计算得到的每秒圈数：95.3675圈/秒\n",
+        encoding="utf-8",
+    )
+    value, used_path = read_scanner_revolutions(point_cloud)
+    assert value == 95.368
+    assert used_path == description
+
+
+def test_scanner_revolutions_support_gb18030_description(tmp_path: Path) -> None:
+    point_cloud = tmp_path / "scan.las"
+    point_cloud.touch()
+    description = scanner_description_path(point_cloud)
+    description.write_text(
+        "计算得到的每秒圈数: 95.367432 圈/秒",
+        encoding="gb18030",
+    )
+    value, _ = read_scanner_revolutions(point_cloud)
+    assert value == 95.367
+
+
+def test_batch_worker_continues_after_one_description_failure(tmp_path: Path) -> None:
+    from PyQt5.QtCore import QCoreApplication
+    import ortho_generator.app as app_module
+
+    QCoreApplication.instance() or QCoreApplication([])
+    first = tmp_path / "first.e57"
+    second = tmp_path / "second.e57"
+    first.touch()
+    second.touch()
+    scanner_description_path(first).write_text(
+        "计算得到的每秒圈数：95.3675圈/秒", encoding="utf-8"
+    )
+    used_rates = []
+
+    def fake_generate(source, output, settings, cancellation, progress):
+        used_rates.append(settings.scanner_revolutions_per_second)
+        return app_module.GenerationResult("run", "manifest", (), 10.0, 0.005, False)
+
+    original = app_module.generate_orthophotos
+    app_module.generate_orthophotos = fake_generate
+    summaries = []
+    try:
+        worker = app_module.GenerationWorker(
+            (str(first), str(second)),
+            str(tmp_path / "out"),
+            GenerationSettings(),
+            auto_scanner_revolutions=True,
+        )
+        worker.succeeded.connect(summaries.append)
+        worker.run()
+    finally:
+        app_module.generate_orthophotos = original
+
+    assert used_rates == [95.368]
+    assert len(summaries) == 1
+    assert len(summaries[0].results) == 1
+    assert len(summaries[0].failures) == 1
+    assert Path(summaries[0].failures[0][0]).name == "second.e57"
 
 
 def test_structured_e57_uses_speed_and_revolutions_for_profile_spacing() -> None:

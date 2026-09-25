@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 from typing import Callable
 
@@ -20,6 +22,12 @@ from .sources import create_source
 
 
 Progress = Callable[[str, int], None]
+
+
+_SCANNER_RATE_PATTERN = re.compile(
+    r"计算得到的每秒圈数\s*[：:]\s*"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*圈\s*/\s*秒"
+)
 
 
 @dataclass(slots=True)
@@ -98,6 +106,37 @@ class GenerationResult:
     estimated_diameter_m: float
     actual_pixel_size_m: float
     resolution_adjusted: bool
+
+
+def scanner_description_path(point_cloud_path: str | Path) -> Path:
+    path = Path(point_cloud_path)
+    return path.with_name(f"{path.stem}_扫描说明.txt")
+
+
+def read_scanner_revolutions(point_cloud_path: str | Path) -> tuple[float, Path]:
+    """Read and half-up round the scanner rate to three decimal places."""
+    description = scanner_description_path(point_cloud_path)
+    if not description.is_file():
+        raise FileNotFoundError(f"未找到扫描说明文件：{description}")
+    content = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            content = description.read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if content is None:
+        raise ValueError(f"无法读取扫描说明文件编码：{description}")
+    match = _SCANNER_RATE_PATTERN.search(content)
+    if match is None:
+        raise ValueError(
+            f"扫描说明中未找到“计算得到的每秒圈数：{{数值}}圈/秒”：{description}"
+        )
+    value = Decimal(match.group(1))
+    rounded = value.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    if rounded <= 0:
+        raise ValueError(f"扫描仪每秒圈数必须为正数：{description}")
+    return float(rounded), description
 
 
 def _grid_shape(
