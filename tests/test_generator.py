@@ -21,6 +21,7 @@ from ortho_generator.service import (
     _longitudinal_columns,
     _longitudinal_positions,
     generate_orthophotos,
+    read_scanner_description,
     read_scanner_revolutions,
     scanner_description_path,
 )
@@ -100,12 +101,17 @@ def test_scanner_revolutions_are_read_and_rounded_half_up(tmp_path: Path) -> Non
     point_cloud.touch()
     description = scanner_description_path(point_cloud)
     description.write_text(
-        "其他说明\n计算得到的每秒圈数：95.3675圈/秒\n",
+        "其他说明\n计算得到的每秒圈数：95.3675圈/秒\n"
+        "分辨率原始值：半断面行数=4267；扫描角度=150度\n",
         encoding="utf-8",
     )
     value, used_path = read_scanner_revolutions(point_cloud)
     assert value == 95.368
     assert used_path == description
+    parsed = read_scanner_description(point_cloud)
+    assert parsed.half_scan_rows == 4267
+    assert parsed.half_scan_angle_degrees == 150.0
+    assert parsed.total_scan_span_degrees == 300.0
 
 
 def test_scanner_revolutions_support_gb18030_description(tmp_path: Path) -> None:
@@ -271,20 +277,25 @@ def test_display_suppresses_only_isolated_extreme_pixels() -> None:
 
 
 def test_structured_rows_get_one_stable_metric_arc_position() -> None:
-    ellipse = EllipseParameters(0.0, 0.0, 2.0, 2.0, 0.0)
-    arc = EllipseArcLookup(ellipse)
-    rows = np.arange(360, dtype=np.uint32)
-    angle = -np.pi / 2 + 2 * np.pi * rows / len(rows)
+    rows = np.arange(301, dtype=np.uint32)
+    angle = -np.pi / 2 + np.deg2rad(300.0) * rows / (len(rows) - 1)
     # Range varies strongly, but scanner angle and source row stay exact.
-    radius = 1.5 + 0.4 * np.sin(rows * 0.37)
+    radius = np.full(len(rows), 5.0)
     x = (radius * np.cos(angle)).astype(np.float64)
     z = (radius * np.sin(angle)).astype(np.float64)
-    lookup, report = _build_structured_row_arc_lookup(x, z, rows, len(rows), arc)
-    expected = rows.astype(np.float64) / len(rows) * arc.circumference
-    circular_error = np.minimum(
-        np.abs(lookup - expected), arc.circumference - np.abs(lookup - expected)
+    lookup, report = _build_structured_row_arc_lookup(
+        x,
+        z,
+        rows,
+        len(rows),
+        300.0,
+        EllipseArcLookup(EllipseParameters(0.0, 0.0, 5.0, 5.0, 0.0)),
     )
-    assert np.max(circular_error) < 1e-9
+    expected_length = 5.0 * np.deg2rad(300.0)
+    assert np.all(np.diff(lookup) > 0)
+    assert np.isclose(lookup[-1], expected_length, rtol=1e-4)
+    assert report["scan_span_degrees"] == 300.0
+    assert report["unobserved_span_degrees"] == 60.0
     assert report["angular_residual_p95_rad"] < 1e-12
 
 
@@ -591,7 +602,7 @@ def test_structured_e57_does_not_enter_las_depth_path(tmp_path: Path) -> None:
         source_factory=StructuredSyntheticSource,
     )
     manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
-    assert manifest["grid"]["rasterization"] == "stable_structured_scan_rows"
+    assert manifest["grid"]["rasterization"] == "actual_span_structured_scan_rows"
     assert manifest["grid"]["scan_profile_spacing_m"] == 0.1
     assert manifest["grid"]["column_axis"] == "scan_column_index_times_profile_spacing"
     assert "las_display_aggregation" not in manifest

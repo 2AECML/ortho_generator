@@ -28,6 +28,10 @@ _SCANNER_RATE_PATTERN = re.compile(
     r"计算得到的每秒圈数\s*[：:]\s*"
     r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*圈\s*/\s*秒"
 )
+_HALF_SCAN_PATTERN = re.compile(
+    r"半断面行数\s*=\s*(\d+)\s*[；;]\s*"
+    r"扫描角度\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*度"
+)
 
 
 @dataclass(slots=True)
@@ -39,6 +43,8 @@ class GenerationSettings:
     auto_estimate_diameter: bool = True
     vehicle_speed_mps: float = 0.4
     scanner_revolutions_per_second: float = 100.0
+    structured_scan_span_degrees: float | None = None
+    structured_expected_scan_rows: int | None = None
     longitudinal_min_m: float | None = None
     longitudinal_max_m: float | None = None
     display_min: float | None = None
@@ -64,6 +70,16 @@ class GenerationSettings:
             or self.scanner_revolutions_per_second <= 0
         ):
             raise ValueError("扫描仪每秒圈数必须为有限正数。")
+        if self.structured_scan_span_degrees is not None and (
+            not np.isfinite(self.structured_scan_span_degrees)
+            or not 0 < self.structured_scan_span_degrees <= 360
+        ):
+            raise ValueError("结构化扫描角度必须在 0到360度之间。")
+        if (
+            self.structured_expected_scan_rows is not None
+            and self.structured_expected_scan_rows <= 0
+        ):
+            raise ValueError("结构化扫描行数必须为正数。")
         if not np.isfinite(self.las_edge_antialias_strength) or not 0 <= self.las_edge_antialias_strength <= 1:
             raise ValueError("LAS 边缘抗锯齿强度必须在 0 到 1 之间。")
         for value in (self.maximum_las_display_relative_depth_m, self.las_display_depth_cluster_m):
@@ -113,8 +129,22 @@ def scanner_description_path(point_cloud_path: str | Path) -> Path:
     return path.with_name(f"{path.stem}_扫描说明.txt")
 
 
-def read_scanner_revolutions(point_cloud_path: str | Path) -> tuple[float, Path]:
-    """Read and half-up round the scanner rate to three decimal places."""
+@dataclass(frozen=True, slots=True)
+class ScannerDescription:
+    revolutions_per_second: float
+    half_scan_rows: int | None
+    half_scan_angle_degrees: float | None
+    path: Path
+
+    @property
+    def total_scan_span_degrees(self) -> float | None:
+        if self.half_scan_angle_degrees is None:
+            return None
+        return min(360.0, 2.0 * self.half_scan_angle_degrees)
+
+
+def read_scanner_description(point_cloud_path: str | Path) -> ScannerDescription:
+    """Read scanner rate and structured angular coverage from its sidecar."""
     description = scanner_description_path(point_cloud_path)
     if not description.is_file():
         raise FileNotFoundError(f"未找到扫描说明文件：{description}")
@@ -136,7 +166,20 @@ def read_scanner_revolutions(point_cloud_path: str | Path) -> tuple[float, Path]
     rounded = value.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
     if rounded <= 0:
         raise ValueError(f"扫描仪每秒圈数必须为正数：{description}")
-    return float(rounded), description
+    geometry = _HALF_SCAN_PATTERN.search(content)
+    half_rows = int(geometry.group(1)) if geometry else None
+    half_angle = float(geometry.group(2)) if geometry else None
+    if half_rows is not None and half_rows <= 0:
+        raise ValueError(f"扫描说明中的半断面行数无效：{description}")
+    if half_angle is not None and not 0 < half_angle <= 180:
+        raise ValueError(f"扫描说明中的半断面角度无效：{description}")
+    return ScannerDescription(float(rounded), half_rows, half_angle, description)
+
+
+def read_scanner_revolutions(point_cloud_path: str | Path) -> tuple[float, Path]:
+    """Backward-compatible scanner-rate reader."""
+    description = read_scanner_description(point_cloud_path)
+    return description.revolutions_per_second, description.path
 
 
 def _grid_shape(
@@ -553,13 +596,15 @@ def _build_structured_row_arc_lookup(
     z: np.ndarray,
     row_index: np.ndarray,
     scan_rows: int,
+    scan_span_degrees: float,
     arc: EllipseArcLookup,
 ) -> tuple[np.ndarray, dict]:
-    """Map each scanner row to one stable physical ellipse-arc position.
+    """Map observed scanner rows onto a smooth reference-section arc.
 
-    EasyTry rows are uniformly spaced laser angles.  Estimating that angle once
-    per source row prevents wall depth and equipment from moving neighboring
-    points between output rows, while retaining the configured metric pixel size.
+    FARO mobile scans commonly cover 300 degrees rather than a full revolution.
+    The row angle comes from that actual span. Rays are intersected with the fitted
+    reference ellipse, so rails, equipment and occlusion edges cannot stretch the
+    output while the unobserved blind sector is not inserted into the image.
     """
     valid = (
         np.isfinite(x)
@@ -571,7 +616,9 @@ def _build_structured_row_arc_lookup(
         raise ValueError("结构化扫描行的角度样本不足。")
     sample_rows = row_index[valid].astype(np.float64)
     observed_angle = np.arctan2(z[valid], x[valid])
-    nominal = 2.0 * np.pi * sample_rows / scan_rows
+    span_rad = float(np.deg2rad(scan_span_degrees))
+    denominator = max(1, scan_rows - 1)
+    nominal = span_rad * sample_rows / denominator
     candidates = []
     for direction in (1.0, -1.0):
         residual_phase = np.exp(1j * (observed_angle - direction * nominal))
@@ -582,7 +629,7 @@ def _build_structured_row_arc_lookup(
     _, direction, offset, residual = min(candidates, key=lambda item: item[0])
 
     source_rows = np.arange(scan_rows, dtype=np.float64)
-    angles = offset + direction * 2.0 * np.pi * source_rows / scan_rows
+    angles = offset + direction * span_rad * source_rows / denominator
     dx = np.cos(angles)
     dz = np.sin(angles)
     ellipse = arc.ellipse
@@ -600,20 +647,38 @@ def _build_structured_row_arc_lookup(
         origin_x[0] * local_dx / a2 + origin_z[0] * local_dz / b2
     )
     quadratic_c = origin_x[0] ** 2 / a2 + origin_z[0] ** 2 / b2 - 1.0
-    discriminant = np.maximum(quadratic_b**2 - 4.0 * quadratic_a * quadratic_c, 0.0)
-    root1 = (-quadratic_b + np.sqrt(discriminant)) / (2.0 * quadratic_a)
-    root2 = (-quadratic_b - np.sqrt(discriminant)) / (2.0 * quadratic_a)
+    discriminant = quadratic_b**2 - 4.0 * quadratic_a * quadratic_c
+    if np.any(discriminant < 0):
+        raise ValueError("扫描原点的部分射线与拟合参考断面无交点。")
+    sqrt_discriminant = np.sqrt(discriminant)
+    root1 = (-quadratic_b + sqrt_discriminant) / (2.0 * quadratic_a)
+    root2 = (-quadratic_b - sqrt_discriminant) / (2.0 * quadratic_a)
     distance = np.maximum(root1, root2)
     if not np.isfinite(distance).all() or np.any(distance <= 0):
-        raise ValueError("扫描原点不在拟合椭圆内部，无法建立稳定扫描行映射。")
-    lookup = arc.project(distance * dx, distance * dz)
+        raise ValueError("扫描原点不在拟合参考断面内，无法建立稳定扫描行映射。")
+    contour_x = distance * dx
+    contour_z = distance * dz
+    step = np.hypot(np.diff(contour_x), np.diff(contour_z))
+    if not np.isfinite(step).all() or np.any(step <= 0):
+        raise ValueError("结构化扫描轮廓弧长无效。")
+    lookup = np.concatenate(([0.0], np.cumsum(step)))
+    angular_p95 = float(np.percentile(residual, 95))
+    if angular_p95 > np.deg2rad(1.0):
+        raise ValueError(
+            f"扫描行与扫描说明中的 {scan_span_degrees:.3f}° 范围不匹配："
+            f"角度残差 P95={np.rad2deg(angular_p95):.3f}°。"
+        )
     return lookup, {
-        "method": "structured_row_angle_to_reference_ellipse",
+        "method": "structured_row_actual_span_reference_section",
         "scan_rows": int(scan_rows),
+        "scan_span_degrees": float(scan_span_degrees),
         "direction": "increasing" if direction > 0 else "decreasing",
         "angular_offset_rad": offset,
         "angular_residual_median_rad": float(np.median(residual)),
-        "angular_residual_p95_rad": float(np.percentile(residual, 95)),
+        "angular_residual_p95_rad": angular_p95,
+        "reference_section_circumference_m": float(arc.circumference),
+        "observed_arc_length_m": float(lookup[-1]),
+        "unobserved_span_degrees": float(360.0 - scan_span_degrees),
     }
 
 
@@ -748,19 +813,42 @@ def generate_orthophotos(
         if metadata.structured_indices:
             if metadata.scan_rows is None or len(geometry_rows) != len(geometry_points):
                 raise ValueError("结构化 E57 缺少有效的扫描行范围。")
+            if (
+                cfg.structured_expected_scan_rows is not None
+                and metadata.scan_rows != cfg.structured_expected_scan_rows
+            ):
+                raise ValueError(
+                    f"E57 扫描行数 {metadata.scan_rows} 与扫描说明中的 "
+                    f"{cfg.structured_expected_scan_rows} 不一致。"
+                )
+            scan_span_degrees = cfg.structured_scan_span_degrees or 360.0
+            if cfg.structured_scan_span_degrees is None:
+                emit(
+                    "警告：未从扫描说明获取扫描角度，结构化 E57 暂按 360° 处理。",
+                    40,
+                )
             structured_row_lookup, structured_mapping = _build_structured_row_arc_lookup(
                 geometry_points[:, 0],
                 geometry_points[:, 1],
                 geometry_rows,
                 metadata.scan_rows,
+                scan_span_degrees,
                 arc,
             )
+            transverse_extent_m = float(structured_mapping["observed_arc_length_m"])
+            emit(
+                f"结构化断面按实际 {scan_span_degrees:.3f}° 扫描范围展开，"
+                f"参考断面弧长 {transverse_extent_m:.3f} m。",
+                40,
+            )
+        else:
+            transverse_extent_m = arc.circumference
         requested_row_count, requested_column_count = _grid_shape(
-            arc.circumference, y_min, y_max, cfg.pixel_size_m, is_las
+            transverse_extent_m, y_min, y_max, cfg.pixel_size_m, is_las
         )
         if cfg.adaptive_single_image:
             effective_pixel_size_m, row_count, column_count = _adaptive_grid_shape(
-                arc.circumference,
+                transverse_extent_m,
                 y_min,
                 y_max,
                 cfg.pixel_size_m,
@@ -848,9 +936,14 @@ def generate_orthophotos(
                 "row_count": row_count,
                 "column_count": column_count,
                 "circumference_m": arc.circumference,
+                "transverse_extent_m": transverse_extent_m,
                 "longitudinal_min_m": y_min,
                 "longitudinal_max_m": y_max,
-                "row_axis": "ellipse_arc_length_from_invert_counterclockwise",
+                "row_axis": (
+                    "actual_span_structured_reference_section_arc"
+                    if structured_row_lookup is not None
+                    else "ellipse_arc_length_from_invert_counterclockwise"
+                ),
                 "column_axis": (
                     "scan_column_index_times_profile_spacing"
                     if metadata.structured_indices
@@ -858,7 +951,7 @@ def generate_orthophotos(
                 ),
                 "column_quantization": "nearest_pixel_center" if is_las else "floor",
                 "rasterization": (
-                    "stable_structured_scan_rows"
+                    "actual_span_structured_scan_rows"
                     if structured_row_lookup is not None
                     else "per_point_ellipse_projection"
                 ),

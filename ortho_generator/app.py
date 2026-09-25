@@ -31,6 +31,7 @@ from .service import (
     GenerationResult,
     GenerationSettings,
     generate_orthophotos,
+    read_scanner_description,
     read_scanner_revolutions,
 )
 from .sources import create_source
@@ -71,12 +72,36 @@ class GenerationWorker(QThread):
                 self.token.throw_if_cancelled()
                 settings = replace(self.settings)
                 try:
-                    if self.auto_scanner_revolutions:
-                        revolutions, description = read_scanner_revolutions(source)
-                        settings.scanner_revolutions_per_second = float(revolutions)
+                    description = None
+                    try:
+                        description = read_scanner_description(source)
+                    except (FileNotFoundError, ValueError):
+                        if self.auto_scanner_revolutions:
+                            raise
+                    if description is not None:
+                        settings.structured_scan_span_degrees = (
+                            description.total_scan_span_degrees
+                        )
+                        settings.structured_expected_scan_rows = (
+                            None
+                            if description.half_scan_rows is None
+                            else 2 * description.half_scan_rows
+                        )
+                    if self.auto_scanner_revolutions and description is not None:
+                        revolutions = description.revolutions_per_second
+                        settings.scanner_revolutions_per_second = revolutions
                         self.progressed.emit(
                             f"[{index}/{total}] {Path(source).name}：根据 "
-                            f"{description.name} 设定为 {revolutions:.3f} 圈/s",
+                            f"{description.path.name} 设定为 {revolutions:.3f} 圈/s",
+                            int((index - 1) / total * 100),
+                        )
+                    if (
+                        description is not None
+                        and description.total_scan_span_degrees is not None
+                    ):
+                        self.progressed.emit(
+                            f"[{index}/{total}] {Path(source).name}：实际断面扫描范围 "
+                            f"{description.total_scan_span_degrees:.3f}°",
                             int((index - 1) / total * 100),
                         )
                     result = generate_orthophotos(
