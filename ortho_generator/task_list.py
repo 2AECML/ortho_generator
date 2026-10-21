@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -98,14 +99,83 @@ class TaskJournal:
         return self.keys_with_status("SUCCESS")
 
     def keys_with_status(self, status: str) -> set[tuple[str, str]]:
-        if not self.path.exists():
-            return set()
         result: set[tuple[str, str]] = set()
-        for line in self.path.read_text(encoding="utf-8-sig").splitlines():
-            columns = line.split("\t", 4)
-            if len(columns) >= 4 and columns[1] == status:
+        for columns in self._rows():
+            if columns[1] == status:
                 result.add((_normal(columns[2]), _normal(columns[3])))
         return result
+
+    def record_generated(self, source: str, output: str, image_paths: tuple[str, ...]) -> None:
+        self.append("GENERATED", source, output, json.dumps(
+            {"image_paths": list(image_paths)}, ensure_ascii=False,
+        ))
+
+    def generated_images(self) -> dict[tuple[str, str], tuple[str, ...]]:
+        result: dict[tuple[str, str], tuple[str, ...]] = {}
+        for columns in self._rows():
+            if columns[1] != "GENERATED" or len(columns) < 5:
+                continue
+            key = (_normal(columns[2]), _normal(columns[3]))
+            result.pop(key, None)
+            try:
+                payload = json.loads(columns[4])
+            except (ValueError, TypeError):
+                continue
+            paths = payload.get("image_paths") if isinstance(payload, dict) else None
+            if isinstance(paths, list) and paths and all(isinstance(p, str) for p in paths):
+                result[key] = tuple(paths)
+        return result
+
+    def matching_sources(self, spec: OrthoTaskSpec, statuses: tuple[str, ...]) -> tuple[str, ...]:
+        output = _normal(spec.output_parent)
+        pattern = str(Path(spec.input_pattern).resolve())
+        matches = {}
+        output_names = {}
+        for columns in self._rows():
+            if columns[1] not in statuses:
+                continue
+            if columns[3] not in output_names:
+                output_names[columns[3]] = _normal(columns[3])
+            if output_names[columns[3]] != output:
+                continue
+            source = Path(columns[2]).resolve()
+            if source.match(pattern) and source.suffix.lower() in (".e57", ".las"):
+                matches[_normal(str(source))] = str(source)
+        return tuple(matches.values())
+
+    def _rows(self) -> list[list[str]]:
+        if not self.path.exists():
+            return []
+        return [columns for line in self.path.read_text(encoding="utf-8-sig").splitlines()
+                if len(columns := line.split("\t", 4)) >= 4]
+
+
+def require_generated_images(image_paths: tuple[str, ...]) -> None:
+    if not image_paths or not all(Path(path).is_file() for path in image_paths):
+        raise RuntimeError("没有确认到完整的正射影像输出，保留输入点云。")
+
+
+def completed_image_outputs(output_parent: str) -> dict[str, tuple[str, ...]]:
+    """Recover output evidence from manifests written before image paths were journaled."""
+    root = Path(output_parent).resolve()
+    result: dict[str, tuple[str, ...]] = {}
+    manifests = list(root.glob("manifest_*.json")) + list(root.glob("*/manifest.json"))
+    for manifest in manifests:
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict) or data.get("status") != "COMPLETED":
+                continue
+            source, images = data.get("input_path"), data.get("images")
+            if (not isinstance(source, str) or not isinstance(images, list) or not images
+                    or not all(isinstance(path, str) for path in images)):
+                continue
+            paths = tuple((manifest.parent / path).resolve() for path in images)
+            if all(path.is_relative_to(root) and path.suffix.lower() == ".png"
+                   and path.is_file() for path in paths):
+                result[_normal(source)] = tuple(map(str, paths))
+        except (OSError, ValueError):
+            continue
+    return result
 
 
 def has_safe_free_space(output_parent: str, minimum: int = MINIMUM_FREE_BYTES) -> tuple[bool, int]:
@@ -118,12 +188,16 @@ def has_safe_free_space(output_parent: str, minimum: int = MINIMUM_FREE_BYTES) -
 
 
 def remove_generated_input(source: str) -> tuple[str, ...]:
-    point_cloud = Path(source).resolve(strict=True)
-    if point_cloud.suffix.lower() != ".e57":
-        return ()
+    point_cloud = Path(source).resolve()
+    if point_cloud.suffix.lower() not in (".e57", ".las"):
+        raise ValueError(f"不支持清理的输入点云格式：{point_cloud}")
     removed: list[str] = []
-    point_cloud.unlink()
-    removed.append(str(point_cloud))
+    try:
+        point_cloud.unlink()
+    except FileNotFoundError:
+        pass
+    else:
+        removed.append(str(point_cloud))
     description = point_cloud.with_name(f"{point_cloud.stem}_扫描说明.txt")
     if description.is_file():
         description.unlink()

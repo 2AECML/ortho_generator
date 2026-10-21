@@ -53,6 +53,8 @@ from .task_list import (
     read_task_list,
     remove_task_specs,
     remove_generated_input,
+    require_generated_images,
+    completed_image_outputs,
 )
 
 
@@ -64,6 +66,7 @@ class BatchGenerationSummary:
     stopped_reason: str | None = None
     log_path: str | None = None
     completed_specs: tuple[OrthoTaskSpec, ...] = ()
+    cleaned_sources: tuple[str, ...] = ()
 
 
 class GenerationWorker(QThread):
@@ -77,18 +80,21 @@ class GenerationWorker(QThread):
         output: str,
         settings: GenerationSettings,
         auto_scanner_revolutions: bool,
+        remove_inputs: bool = False,
     ) -> None:
         super().__init__()
         self.sources = sources
         self.output = output
         self.settings = settings
         self.auto_scanner_revolutions = auto_scanner_revolutions
+        self.remove_inputs = remove_inputs
         self.token = CancellationToken()
 
     def run(self) -> None:
         try:
             results: list[tuple[str, GenerationResult]] = []
             failures: list[tuple[str, str]] = []
+            cleaned_sources: list[str] = []
             total = len(self.sources)
             for index, source in enumerate(self.sources, start=1):
                 self.token.throw_if_cancelled()
@@ -129,7 +135,22 @@ class GenerationWorker(QThread):
                             min(99, int(((i - 1) + percent / 100.0) / total * 100)),
                         ),
                     )
+                    if self.remove_inputs:
+                        require_generated_images(result.image_paths)
                     results.append((source, result))
+                    if self.remove_inputs:
+                        self.token.throw_if_cancelled()
+                        try:
+                            removed = remove_generated_input(source)
+                            cleaned_sources.append(source)
+                            self.progressed.emit(
+                                f"[{index}/{total}] 已移除输入点云及扫描说明：{'；'.join(removed)}",
+                                int(index / total * 100),
+                            )
+                        except Exception as error:
+                            message = f"影像已生成，但移除输入失败：{error}"
+                            failures.append((source, message))
+                            self.progressed.emit(message, int(index / total * 100))
                 except ProcessingCancelledError:
                     raise
                 except Exception as error:
@@ -140,7 +161,8 @@ class GenerationWorker(QThread):
                     )
             self.succeeded.emit(
                 BatchGenerationSummary(
-                    self.output, tuple(results), tuple(failures)
+                    self.output, tuple(results), tuple(failures),
+                    cleaned_sources=tuple(cleaned_sources),
                 )
             )
         except Exception as error:
@@ -176,14 +198,22 @@ class TaskListGenerationWorker(QThread):
             failures: list[tuple[str, str]] = []
             completed = journal.completed()
             generated = journal.keys_with_status("GENERATED")
+            known_images = journal.generated_images()
+            output_images: dict[str, dict[str, tuple[str, ...]]] = {}
+            cleanup_failures: set[tuple[str, str]] = set()
+            cleaned_sources: list[str] = []
             for spec in self.specs:
                 sources = expand_task(spec)
+                if self.remove_inputs:
+                    orphaned = tuple(
+                        source for source in journal.matching_sources(spec, ("GENERATED", "SUCCESS"))
+                        if not Path(source).exists()
+                        and Path(source).with_name(f"{Path(source).stem}_扫描说明.txt").is_file()
+                    )
+                    sources = tuple(dict.fromkeys((*sources, *orphaned)))
                 expanded_by_spec[spec] = sources
                 if not sources:
-                    normalized_output = str(Path(spec.output_parent).resolve()).casefold()
-                    if self.remove_inputs and any(
-                        output == normalized_output for _, output in completed
-                    ):
+                    if self.remove_inputs and journal.matching_sources(spec, ("SUCCESS",)):
                         self.progressed.emit(
                             f"已完成并清理的任务组：{spec.input_pattern}", 0
                         )
@@ -197,7 +227,7 @@ class TaskListGenerationWorker(QThread):
             pending = [
                 item for item in expanded
                 if (str(Path(item[0]).resolve()).casefold(), str(Path(item[1]).resolve()).casefold())
-                not in completed
+                not in completed or self.remove_inputs
             ]
             skipped = len(expanded) - len(pending)
             if skipped:
@@ -212,9 +242,17 @@ class TaskListGenerationWorker(QThread):
                     str(Path(source).resolve()).casefold(),
                     str(Path(output).resolve()).casefold(),
                 )
-                if self.remove_inputs and task_key in generated:
+                if self.remove_inputs and task_key in (generated | completed):
                     try:
+                        image_paths = known_images.get(task_key)
+                        if image_paths is None:
+                            if task_key[1] not in output_images:
+                                output_images[task_key[1]] = completed_image_outputs(output)
+                            image_paths = output_images[task_key[1]].get(task_key[0], ())
+                        require_generated_images(image_paths)
+                        self.token.throw_if_cancelled()
                         removed = remove_generated_input(source)
+                        cleaned_sources.append(source)
                         journal.append("REMOVED", source, output, "；".join(removed))
                         journal.append("SUCCESS", source, output, "恢复流程仅完成输入清理")
                         self.progressed.emit(
@@ -222,10 +260,14 @@ class TaskListGenerationWorker(QThread):
                             int(index / max(1, total) * 100),
                         )
                         continue
+                    except ProcessingCancelledError:
+                        raise
                     except Exception as error:
-                        message = f"已有影像，但移除输入失败：{error}"
+                        message = f"历史成图任务的输入清理失败：{error}"
                         failures.append((source, message))
+                        cleanup_failures.add(task_key)
                         journal.append("CLEANUP_FAILED", source, output, message)
+                        self.progressed.emit(message, int(index / max(1, total) * 100))
                         continue
                 safe, free = has_safe_free_space(output)
                 if not safe:
@@ -272,15 +314,14 @@ class TaskListGenerationWorker(QThread):
                     result = generate_orthophotos(
                         source, output, settings, self.token, report
                     )
-                    if not result.image_paths or not all(
-                        Path(path).is_file() for path in result.image_paths
-                    ):
-                        raise RuntimeError("没有确认到完整的正射影像输出，保留输入点云。")
+                    require_generated_images(result.image_paths)
                     results.append((source, result))
-                    journal.append("GENERATED", source, output, f"生成 {len(result.image_paths)} 幅影像")
+                    journal.record_generated(source, output, result.image_paths)
                     if self.remove_inputs:
+                        self.token.throw_if_cancelled()
                         try:
                             removed = remove_generated_input(source)
+                            cleaned_sources.append(source)
                             journal.append("REMOVED", source, output, "；".join(removed))
                             self.progressed.emit(
                                 f"[{index}/{max(1, total)}] 已移除输入点云及扫描说明。",
@@ -289,7 +330,9 @@ class TaskListGenerationWorker(QThread):
                         except Exception as error:
                             message = f"影像已生成，但移除输入失败：{error}"
                             failures.append((source, message))
+                            cleanup_failures.add(task_key)
                             journal.append("CLEANUP_FAILED", source, output, message)
+                            self.progressed.emit(message, int(index / max(1, total) * 100))
                             continue
                     journal.append("SUCCESS", source, output, f"生成 {len(result.image_paths)} 幅影像")
                 except ProcessingCancelledError:
@@ -308,7 +351,7 @@ class TaskListGenerationWorker(QThread):
                     )
 
             output_parent = self.specs[-1].output_parent if self.specs else ""
-            final_completed = journal.completed()
+            final_completed = journal.completed() - cleanup_failures
             completed_specs = tuple(
                 spec
                 for spec, sources in expanded_by_spec.items()
@@ -325,10 +368,7 @@ class TaskListGenerationWorker(QThread):
                 or (
                     not sources
                     and self.remove_inputs
-                    and any(
-                        output == str(Path(spec.output_parent).resolve()).casefold()
-                        for _, output in final_completed
-                    )
+                    and journal.matching_sources(spec, ("SUCCESS",))
                 )
             )
             self.succeeded.emit(BatchGenerationSummary(
@@ -338,6 +378,7 @@ class TaskListGenerationWorker(QThread):
                 stopped_reason,
                 str(journal.path),
                 completed_specs,
+                tuple(cleaned_sources),
             ))
         except Exception as error:
             self.failed.emit(str(error))
@@ -481,7 +522,8 @@ class MainWindow(QMainWindow):
         )
         self.remove_input_after_success.setChecked(False)
         self.remove_input_after_success.setToolTip(
-            "仅在对应点云成功生成至少一幅正射影像后，移除 .e57 与同名的 _扫描说明.txt。"
+            "普通文件与任务清单均生效；确认正射影像完整后移除 E57/LAS 与同名的扫描说明。"
+            "清单中已成图但未清理的输入会核对输出后补清理。"
         )
         source_form.addRow("完成后清理", self.remove_input_after_success)
         self.remove_completed_task_items = QCheckBox("成功后从清单移除任务")
@@ -914,6 +956,7 @@ class MainWindow(QMainWindow):
             output,
             settings,
             self.auto_scanner_revolutions.isChecked(),
+            self.remove_input_after_success.isChecked(),
         )
         self.worker.progressed.connect(self._progressed)
         self.worker.succeeded.connect(self._succeeded)
@@ -975,11 +1018,13 @@ class MainWindow(QMainWindow):
         self.generate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.remove_completed_task_items.setEnabled(True)
-        self.open_button.setEnabled(bool(summary.results))
+        self.open_button.setEnabled(bool(summary.results or summary.cleaned_sources))
         message = (
             f"批量处理完成：{len(summary.results)} 个成功，"
             f"{len(summary.failures)} 个失败，共生成 {total_images} 幅影像。"
         )
+        if summary.cleaned_sources:
+            message += f"\n已清理 {len(summary.cleaned_sources)} 个输入点云及对应扫描说明。"
         if summary.stopped_reason:
             QMessageBox.warning(
                 self,
