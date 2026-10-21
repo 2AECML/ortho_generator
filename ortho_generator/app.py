@@ -39,7 +39,8 @@ from .service import (
     GenerationSettings,
     generate_orthophotos,
     read_scanner_description,
-    read_scanner_revolutions,
+    scanner_parameter_summary,
+    settings_with_scanner_description,
 )
 from .sources import create_source
 from .task_list import (
@@ -100,20 +101,13 @@ class GenerationWorker(QThread):
                         if self.auto_scanner_revolutions:
                             raise
                     if description is not None:
-                        settings.structured_scan_span_degrees = (
-                            description.total_scan_span_degrees
-                        )
-                        settings.structured_expected_scan_rows = (
-                            None
-                            if description.half_scan_rows is None
-                            else 2 * description.half_scan_rows
+                        settings = settings_with_scanner_description(
+                            settings, description, self.auto_scanner_revolutions
                         )
                     if self.auto_scanner_revolutions and description is not None:
-                        revolutions = description.revolutions_per_second
-                        settings.scanner_revolutions_per_second = revolutions
                         self.progressed.emit(
                             f"[{index}/{total}] {Path(source).name}：根据 "
-                            f"{description.path.name} 设定为 {revolutions:.3f} 圈/s",
+                            f"{description.path.name} 设定 {scanner_parameter_summary(description)}",
                             int((index - 1) / total * 100),
                         )
                     if (
@@ -254,13 +248,15 @@ class TaskListGenerationWorker(QThread):
                         if self.auto_scanner_revolutions:
                             raise
                     if description is not None:
-                        settings.structured_scan_span_degrees = description.total_scan_span_degrees
-                        settings.structured_expected_scan_rows = (
-                            None if description.half_scan_rows is None
-                            else 2 * description.half_scan_rows
+                        settings = settings_with_scanner_description(
+                            settings, description, self.auto_scanner_revolutions
                         )
                     if self.auto_scanner_revolutions and description is not None:
-                        settings.scanner_revolutions_per_second = description.revolutions_per_second
+                        self.progressed.emit(
+                            f"[{index}/{max(1, total)}] {Path(source).name}：根据 "
+                            f"{description.path.name} 设定 {scanner_parameter_summary(description)}",
+                            int((index - 1) / max(1, total) * 100),
+                        )
 
                     def report(message: str, percent: int) -> None:
                         nonlocal low_space
@@ -406,10 +402,12 @@ class MainWindow(QMainWindow):
         self.last_output: str | None = None
         self.task_specs: tuple[OrthoTaskSpec, ...] = ()
         self.task_list_path: str | None = None
+        self._scanner_preview_baseline: dict[str, float | bool] = {}
         self.setWindowTitle("隧道点云大幅正射成图")
         self.setMinimumSize(680, 480)
         self.resize(920, 700)
         self._build_ui()
+        self.source_edit.textChanged.connect(self._source_selection_changed)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -525,13 +523,13 @@ class MainWindow(QMainWindow):
         self.auto_scanner_revolutions.setChecked(True)
         self.scanner_revolutions.setEnabled(False)
         self.auto_scanner_revolutions.setToolTip(
-            "从每个点云同目录的“文件名_扫描说明.txt”读取并四舍五入；"
-            "批量处理时每个文件分别设定。"
+            "从每个点云同目录的“文件名_扫描说明.txt”读取圈数、小车速度和内径；"
+            "环宽仅记录。缺少新增字段时沿用手工设置；批量处理按每个文件分别设定。"
         )
         self.auto_scanner_revolutions.toggled.connect(
             self._auto_scanner_revolutions_toggled
         )
-        form.addRow("圈数来源", self.auto_scanner_revolutions)
+        form.addRow("扫描参数来源", self.auto_scanner_revolutions)
         self.profile_spacing = QLabel()
         form.addRow("计算断面间距", self.profile_spacing)
         self.vehicle_speed.valueChanged.connect(self._update_profile_spacing)
@@ -758,9 +756,29 @@ class MainWindow(QMainWindow):
         return paths
 
     def _auto_scanner_revolutions_toggled(self, checked: bool) -> None:
+        self._restore_scanner_parameter_preview()
         self.scanner_revolutions.setEnabled(not checked)
         if checked:
             self._sync_scanner_revolutions(show_errors=True)
+
+    def _source_selection_changed(self) -> None:
+        self._restore_scanner_parameter_preview()
+        if self.auto_scanner_revolutions.isChecked():
+            self._sync_scanner_revolutions(show_errors=False)
+
+    def _restore_scanner_parameter_preview(self) -> None:
+        baseline = self._scanner_preview_baseline
+        self._scanner_preview_baseline = {}
+        if "vehicle_speed_mps" in baseline:
+            self.vehicle_speed.setValue(baseline["vehicle_speed_mps"])
+        if "scanner_revolutions_per_second" in baseline:
+            self.scanner_revolutions.setValue(baseline["scanner_revolutions_per_second"])
+        if "expected_diameter_m" in baseline:
+            self.diameter.setValue(baseline["expected_diameter_m"])
+            self.auto_diameter.setChecked(baseline["auto_estimate_diameter"])
+        self.vehicle_speed.setEnabled(True)
+        self.auto_diameter.setEnabled(True)
+        self.diameter.setEnabled(not self.auto_diameter.isChecked())
 
     def _output_auxiliary_data_toggled(self, checked: bool) -> None:
         if checked:
@@ -768,22 +786,41 @@ class MainWindow(QMainWindow):
         self.flat_image_output.setEnabled(not checked)
 
     def _sync_scanner_revolutions(self, show_errors: bool) -> None:
+        self._restore_scanner_parameter_preview()
+        if self.task_specs:
+            self.auto_scanner_revolutions.setToolTip("任务清单中的扫描参数将在成图时按文件分别读取。")
+            return
         paths = self._source_paths()
         if not paths:
+            self.auto_scanner_revolutions.setToolTip("选择点云后自动读取对应扫描说明中的参数。")
             return
         try:
-            rates = [read_scanner_revolutions(path)[0] for path in paths]
-            self.scanner_revolutions.setValue(float(rates[0]))
-            if len(set(rates)) == 1:
-                detail = f"已从扫描说明读取：{rates[0]:.3f} 圈/s"
-            else:
-                detail = (
-                    f"批次内圈数不同（{min(rates):.3f}–{max(rates):.3f} 圈/s）；"
-                    "成图时将按文件分别使用。"
+            descriptions = [read_scanner_description(path) for path in paths]
+            first = descriptions[0]
+            self._scanner_preview_baseline["scanner_revolutions_per_second"] = (
+                self.scanner_revolutions.value()
+            )
+            self.scanner_revolutions.setValue(first.revolutions_per_second)
+            if first.vehicle_speed_mps is not None:
+                self._scanner_preview_baseline["vehicle_speed_mps"] = self.vehicle_speed.value()
+                self.vehicle_speed.setValue(first.vehicle_speed_mps)
+                self.vehicle_speed.setEnabled(False)
+            if first.inner_diameter_m is not None:
+                self._scanner_preview_baseline.update(
+                    expected_diameter_m=self.diameter.value(),
+                    auto_estimate_diameter=self.auto_diameter.isChecked(),
                 )
+                self.auto_diameter.setChecked(False)
+                self.auto_diameter.setEnabled(False)
+                self.diameter.setValue(first.inner_diameter_m)
+                self.diameter.setEnabled(False)
+            detail = f"{Path(paths[0]).name}：{scanner_parameter_summary(first)}"
+            if len(paths) > 1:
+                detail += "。当前显示首个文件参数；成图时按每个文件分别读取，缺少新增字段使用原手工设置。"
             self.auto_scanner_revolutions.setToolTip(detail)
             self._update_profile_spacing()
         except Exception as error:
+            self.auto_scanner_revolutions.setToolTip(f"扫描说明读取失败：{error}")
             if show_errors:
                 QMessageBox.warning(self, "扫描说明读取失败", str(error))
 
@@ -801,16 +838,19 @@ class MainWindow(QMainWindow):
     def _settings(self) -> GenerationSettings:
         if not self.coordinate_confirmed.isChecked():
             raise ValueError("请先确认点云坐标轴定义。")
+        baseline = self._scanner_preview_baseline
         return GenerationSettings(
             pixel_size_m=float(self.pixel_size.currentText()) / 1000.0,
             image_length_m=self.image_length.value(),
             adaptive_single_image=self.adaptive_single_image.isChecked(),
             output_auxiliary_data=self.output_auxiliary_data.isChecked(),
             flat_image_output=self.flat_image_output.isChecked(),
-            expected_diameter_m=self.diameter.value(),
-            auto_estimate_diameter=self.auto_diameter.isChecked(),
-            vehicle_speed_mps=self.vehicle_speed.value(),
-            scanner_revolutions_per_second=self.scanner_revolutions.value(),
+            expected_diameter_m=baseline.get("expected_diameter_m", self.diameter.value()),
+            auto_estimate_diameter=baseline.get("auto_estimate_diameter", self.auto_diameter.isChecked()),
+            vehicle_speed_mps=baseline.get("vehicle_speed_mps", self.vehicle_speed.value()),
+            scanner_revolutions_per_second=baseline.get(
+                "scanner_revolutions_per_second", self.scanner_revolutions.value()
+            ),
             longitudinal_min_m=self._optional_number(self.y_min),
             longitudinal_max_m=self._optional_number(self.y_max),
             display_min=self._optional_number(self.display_min),
@@ -905,7 +945,7 @@ class MainWindow(QMainWindow):
                 f"  等效直径 {result.estimated_diameter_m:.3f} m | "
                 f"实际像素 {result.actual_pixel_size_m * 1000:.3f} mm"
             )
-        if summary.results:
+        if summary.results and "expected_diameter_m" not in self._scanner_preview_baseline:
             self.diameter.setValue(summary.results[-1][1].estimated_diameter_m)
         for source, error in summary.failures:
             self.log.appendPlainText(f"失败 {Path(source).name}：{error}")

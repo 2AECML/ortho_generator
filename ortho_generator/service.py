@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 import json
@@ -45,6 +45,7 @@ class GenerationSettings:
     expected_diameter_m: float = 5.4
     auto_estimate_diameter: bool = True
     vehicle_speed_mps: float = 0.4
+    ring_width_m: float | None = None
     scanner_revolutions_per_second: float = 100.0
     structured_scan_span_degrees: float | None = None
     structured_expected_scan_rows: int | None = None
@@ -70,6 +71,10 @@ class GenerationSettings:
             raise ValueError("输出辅助数据时不能开启影像集中存放。")
         if not np.isfinite(self.vehicle_speed_mps) or self.vehicle_speed_mps <= 0:
             raise ValueError("小车速度必须为有限正数。")
+        if self.ring_width_m is not None and (
+            not np.isfinite(self.ring_width_m) or self.ring_width_m <= 0
+        ):
+            raise ValueError("环宽必须为有限正数。")
         if (
             not np.isfinite(self.scanner_revolutions_per_second)
             or self.scanner_revolutions_per_second <= 0
@@ -154,6 +159,9 @@ class ScannerDescription:
     half_scan_rows: int | None
     half_scan_angle_degrees: float | None
     path: Path
+    vehicle_speed_mps: float | None = None
+    ring_width_m: float | None = None
+    inner_diameter_m: float | None = None
 
     @property
     def total_scan_span_degrees(self) -> float | None:
@@ -162,8 +170,23 @@ class ScannerDescription:
         return min(360.0, 2.0 * self.half_scan_angle_degrees)
 
 
+def _optional_description_measurement(content: str, label: str, unit: str) -> float | None:
+    """Ignore unavailable/invalid optional TLSD values in old or incomplete sidecars."""
+    match = re.search(
+        rf"^\s*{label}\s*[：:]\s*"
+        rf"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*"
+        rf"(?:{unit})\s*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    value = float(match.group(1))
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def read_scanner_description(point_cloud_path: str | Path) -> ScannerDescription:
-    """Read scanner rate and structured angular coverage from its sidecar."""
+    """Read scanner rate, coverage and optional TLSD parameters from its sidecar."""
     description = scanner_description_path(point_cloud_path)
     if not description.is_file():
         raise FileNotFoundError(f"未找到扫描说明文件：{description}")
@@ -192,7 +215,49 @@ def read_scanner_description(point_cloud_path: str | Path) -> ScannerDescription
         raise ValueError(f"扫描说明中的半断面行数无效：{description}")
     if half_angle is not None and not 0 < half_angle <= 180:
         raise ValueError(f"扫描说明中的半断面角度无效：{description}")
-    return ScannerDescription(float(rounded), half_rows, half_angle, description)
+    return ScannerDescription(
+        float(rounded), half_rows, half_angle, description,
+        vehicle_speed_mps=_optional_description_measurement(
+            content, "小车速度", r"m\s*/\s*s|米\s*/\s*秒"
+        ),
+        ring_width_m=_optional_description_measurement(content, "环宽", "m|米"),
+        inner_diameter_m=_optional_description_measurement(content, "内径", "m|米"),
+    )
+
+
+def settings_with_scanner_description(
+    settings: GenerationSettings,
+    description: ScannerDescription,
+    automatic_parameters: bool,
+) -> GenerationSettings:
+    """Apply one input's sidecar to a fresh copy, preserving missing-field fallbacks."""
+    changes = {
+        "structured_scan_span_degrees": description.total_scan_span_degrees,
+        "structured_expected_scan_rows": (
+            None if description.half_scan_rows is None else 2 * description.half_scan_rows
+        ),
+    }
+    if automatic_parameters:
+        changes["scanner_revolutions_per_second"] = description.revolutions_per_second
+        if description.vehicle_speed_mps is not None:
+            changes["vehicle_speed_mps"] = description.vehicle_speed_mps
+        if description.ring_width_m is not None:
+            changes["ring_width_m"] = description.ring_width_m
+        if description.inner_diameter_m is not None:
+            changes["expected_diameter_m"] = description.inner_diameter_m
+            changes["auto_estimate_diameter"] = False
+    return replace(settings, **changes)
+
+
+def scanner_parameter_summary(description: ScannerDescription) -> str:
+    parts = [f"{description.revolutions_per_second:.3f} 圈/s"]
+    if description.vehicle_speed_mps is not None:
+        parts.append(f"小车速度 {description.vehicle_speed_mps:g} m/s")
+    if description.ring_width_m is not None:
+        parts.append(f"环宽 {description.ring_width_m:g} m（仅记录）")
+    if description.inner_diameter_m is not None:
+        parts.append(f"直径 {description.inner_diameter_m:g} m")
+    return "；".join(parts)
 
 
 def read_scanner_revolutions(point_cloud_path: str | Path) -> tuple[float, Path]:
