@@ -2,7 +2,6 @@ from pathlib import Path
 
 from ortho_generator.task_list import (
     OrthoTaskSpec,
-    TaskJournal,
     expand_task,
     read_task_list,
     remove_task_specs,
@@ -25,17 +24,6 @@ def test_read_and_expand_task_list(tmp_path: Path) -> None:
 
     assert len(specs) == 1
     assert [Path(path).name for path in expand_task(specs[0])] == ["a.e57", "b.e57"]
-
-
-def test_task_journal_recovers_completed_items(tmp_path: Path) -> None:
-    journal = TaskJournal(tmp_path / "run.txt")
-    journal.append("START", "source.e57", "out")
-    journal.append("SUCCESS", "source.e57", "out", "ok")
-
-    assert (
-        str((Path.cwd() / "source.e57").resolve()).casefold(),
-        str((Path.cwd() / "out").resolve()).casefold(),
-    ) in journal.completed()
 
 
 def test_remove_generated_input_removes_matching_description(tmp_path: Path) -> None:

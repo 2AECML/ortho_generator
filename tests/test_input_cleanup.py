@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 
@@ -6,7 +5,7 @@ import pytest
 from PIL import Image
 
 from ortho_generator.cancellation import ProcessingCancelledError
-from ortho_generator.task_list import OrthoTaskSpec, TaskJournal, remove_generated_input
+from ortho_generator.task_list import OrthoTaskSpec, remove_generated_input
 
 
 @pytest.fixture(scope="session")
@@ -24,7 +23,6 @@ def cleanup_case(tmp_path, monkeypatch, cleanup_qt_application):
 
     calls = []
     output = tmp_path / "output"
-    journal = TaskJournal(tmp_path / "journal.txt")
 
     def generate(source, destination, settings, token, progress):
         calls.append(source)
@@ -34,7 +32,6 @@ def cleanup_case(tmp_path, monkeypatch, cleanup_qt_application):
         return app.GenerationResult(str(image.parent), None, (str(image),), 5.4, 0.005, False)
 
     monkeypatch.setattr(app, "generate_orthophotos", generate)
-    monkeypatch.setattr(app, "journal_path_for", lambda _: journal.path)
     monkeypatch.setattr(app, "has_safe_free_space", lambda _: (True, 1024**4))
 
     def source(extension=".e57"):
@@ -47,7 +44,7 @@ def cleanup_case(tmp_path, monkeypatch, cleanup_qt_application):
     def run(cloud, task_mode=True, remove=True, pattern=None):
         if task_mode:
             worker = app.TaskListGenerationWorker(
-                (OrthoTaskSpec(pattern or str(cloud), str(output)),), str(tmp_path / "tasks.txt"),
+                (OrthoTaskSpec(pattern or str(cloud), str(output)),),
                 app.GenerationSettings(), False, remove,
             )
         else:
@@ -60,14 +57,14 @@ def cleanup_case(tmp_path, monkeypatch, cleanup_qt_application):
         worker.run()
         return summaries, errors
 
-    return app, source, run, output, journal, calls
+    return app, source, run, output, calls
 
 
 @pytest.mark.parametrize("task_mode", [False, True])
 @pytest.mark.parametrize("extension", [".e57", ".las"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_cleanup_option_controls_both_modes_and_formats(cleanup_case, task_mode, extension, enabled):
-    _, make_source, run, _, journal, calls = cleanup_case
+    _, make_source, run, _, calls = cleanup_case
     source, description = make_source(extension)
 
     summaries, errors = run(source, task_mode, enabled)
@@ -80,11 +77,11 @@ def test_cleanup_option_controls_both_modes_and_formats(cleanup_case, task_mode,
     assert summary.cleaned_sources == ((str(source),) if enabled else ())
     assert all(Path(path).is_file() for path in summary.results[0][1].image_paths)
     if task_mode:
-        assert bool(journal.keys_with_status("REMOVED")) is enabled
+        assert len(summary.completed_specs) == 1
 
 
 def test_ordinary_ui_passes_checked_cleanup_option(cleanup_case, monkeypatch):
-    app, make_source, _, output, _, _ = cleanup_case
+    app, make_source, _, output, _ = cleanup_case
     source, description = make_source()
     monkeypatch.setattr(app.GenerationWorker, "start", lambda self: self.run())
     messages = []
@@ -108,7 +105,7 @@ def test_ordinary_ui_passes_checked_cleanup_option(cleanup_case, monkeypatch):
 @pytest.mark.parametrize("task_mode", [False, True])
 @pytest.mark.parametrize("missing_image", [False, True])
 def test_missing_or_empty_output_never_deletes_input(cleanup_case, monkeypatch, task_mode, missing_image):
-    app, make_source, run, output, _, _ = cleanup_case
+    app, make_source, run, output, _ = cleanup_case
     source, description = make_source()
     paths = (str(output / "missing.png"),) if missing_image else ()
     monkeypatch.setattr(app, "generate_orthophotos", lambda *args: app.GenerationResult(
@@ -126,7 +123,7 @@ def test_missing_or_empty_output_never_deletes_input(cleanup_case, monkeypatch, 
 @pytest.mark.parametrize("task_mode", [False, True])
 @pytest.mark.parametrize("cancelled", [False, True])
 def test_generation_failure_or_cancellation_preserves_input(cleanup_case, monkeypatch, task_mode, cancelled):
-    app, make_source, run, _, _, _ = cleanup_case
+    app, make_source, run, _, _ = cleanup_case
     source, description = make_source()
 
     def fail(*args):
@@ -143,7 +140,7 @@ def test_generation_failure_or_cancellation_preserves_input(cleanup_case, monkey
 
 @pytest.mark.parametrize("task_mode", [False, True])
 def test_cleanup_permission_failure_reports_error_and_preserves_outputs(cleanup_case, monkeypatch, task_mode):
-    _, make_source, run, _, journal, _ = cleanup_case
+    _, make_source, run, _, _ = cleanup_case
     source, description = make_source()
     original_unlink = Path.unlink
 
@@ -160,114 +157,147 @@ def test_cleanup_permission_failure_reports_error_and_preserves_outputs(cleanup_
     assert all(Path(path).is_file() for path in summary.results[0][1].image_paths)
     assert not summary.cleaned_sources
     if task_mode:
-        assert journal.keys_with_status("CLEANUP_FAILED")
         assert not summary.completed_specs
 
 
-def test_completed_task_can_be_cleaned_later_without_regeneration(cleanup_case):
-    _, make_source, run, _, _, calls = cleanup_case
+def test_repeated_task_selection_runs_again_without_saved_history(cleanup_case):
+    _, make_source, run, output, calls = cleanup_case
     source, description = make_source()
-    pattern = str(source.with_name("*.e57"))
-    assert not run(source, remove=False, pattern=pattern)[0][0].failures
+    first = run(source, remove=False)[0][0]
+    second = run(source, remove=False)[0][0]
 
-    summary = run(source, pattern=pattern)[0][0]
+    assert len(calls) == 2
+    assert first.results and second.results
+    assert first.completed_specs == second.completed_specs
+    assert source.exists() and description.exists()
+    assert {path.name for path in output.iterdir()} == {"input.png"}
 
-    assert len(calls) == 1 and not summary.results
-    assert not summary.failures and summary.cleaned_sources == (str(source),)
+
+def test_completed_task_can_be_generated_and_cleaned_in_later_run(cleanup_case):
+    _, make_source, run, _, calls = cleanup_case
+    source, description = make_source()
+    run(source, remove=False)
+    summary = run(source)[0][0]
+
+    assert len(calls) == 2 and summary.results and not summary.failures
+    assert summary.cleaned_sources == (str(source),)
     assert not source.exists() and not description.exists()
     assert len(summary.completed_specs) == 1
 
 
-@pytest.mark.parametrize("layout", ["flat", "nested"])
-def test_old_success_logs_recover_output_evidence_from_manifest(cleanup_case, layout):
-    _, make_source, run, output, journal, calls = cleanup_case
+def test_missing_task_is_not_marked_complete(cleanup_case):
+    _, make_source, run, _, calls = cleanup_case
     source, description = make_source()
-    directory = output if layout == "flat" else output / "run"
-    image = directory / "orthophotos" / "image.png"
-    image.parent.mkdir(parents=True)
-    Image.new("L", (2, 2)).save(image)
-    manifest = directory / ("manifest_image.json" if layout == "flat" else "manifest.json")
-    manifest.write_text(json.dumps(dict(
-        status="COMPLETED", input_path=str(source), images=[image.relative_to(directory).as_posix()],
-    )), encoding="utf-8")
-    journal.append("GENERATED", str(source), str(output), "生成 1 幅影像")
-    journal.append("SUCCESS", str(source), str(output), "旧版成功记录")
-
-    summary = run(source)[0][0]
-
-    assert not calls and not summary.failures
-    assert not source.exists() and not description.exists() and image.exists()
-    assert summary.cleaned_sources == (str(source),)
-
-
-@pytest.mark.parametrize("invalid", ["no_manifest", "wrong_input", "running", "partial_images"])
-def test_old_success_without_complete_matching_outputs_is_not_deleted(cleanup_case, invalid):
-    _, make_source, run, output, journal, calls = cleanup_case
-    source, description = make_source()
-    output.mkdir()
-    image = output / "image.png"
-    Image.new("L", (2, 2)).save(image)
-    if invalid != "no_manifest":
-        (output / "manifest_image.json").write_text(json.dumps(dict(
-            status="RUNNING" if invalid == "running" else "COMPLETED",
-            input_path=str(source.with_name("other.e57")) if invalid == "wrong_input" else str(source),
-            images=[image.name, "missing.png"] if invalid == "partial_images" else [image.name],
-        )), encoding="utf-8")
-    journal.append("GENERATED", str(source), str(output), "生成 1 幅影像")
-    journal.append("SUCCESS", str(source), str(output), "旧版成功记录")
-
-    summary = run(source)[0][0]
-
-    assert not calls and summary.failures and not summary.completed_specs
-    assert source.exists() and description.exists() and image.exists()
-    assert journal.keys_with_status("CLEANUP_FAILED")
-
-
-def test_partial_cleanup_retries_orphaned_description_without_regeneration(cleanup_case, monkeypatch):
-    _, make_source, run, _, _, calls = cleanup_case
-    source, description = make_source()
-    original_unlink = Path.unlink
-    denied = []
-
-    def deny_description_once(path, *args, **kwargs):
-        if path == description and not denied:
-            denied.append(True)
-            raise PermissionError("description is locked")
-        return original_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "unlink", deny_description_once)
-    pattern = str(source.with_name("*.e57"))
-    first = run(source, pattern=pattern)[0][0]
-    assert first.failures and not source.exists() and description.exists()
-
-    second = run(source, pattern=pattern)[0][0]
-
-    assert len(calls) == 1 and not second.failures
-    assert not description.exists() and second.cleaned_sources == (str(source),)
-    assert len(second.completed_specs) == 1
-
-
-def test_cleanup_disabled_still_skips_already_completed_tasks(cleanup_case):
-    _, make_source, run, _, _, calls = cleanup_case
-    source, description = make_source()
-    run(source, remove=False)
-
-    summary = run(source, remove=False)[0][0]
-
-    assert len(calls) == 1 and not summary.results and not summary.failures
-    assert source.exists() and description.exists()
-
-
-def test_missing_task_does_not_match_another_task_in_same_output(cleanup_case):
-    _, make_source, run, output, journal, calls = cleanup_case
-    source, _ = make_source()
-    other = source.with_name("other.e57")
-    journal.append("SUCCESS", str(other), str(output))
     source.unlink()
 
     summary = run(source)[0][0]
 
     assert not calls and summary.failures and not summary.completed_specs
+    assert description.exists()
+
+
+def test_task_list_removes_only_groups_completed_in_current_run(cleanup_case, monkeypatch, tmp_path):
+    app, make_source, _, output, calls = cleanup_case
+    source, _ = make_source()
+    failing = source.with_name("failing.e57")
+    failing.write_bytes(b"test")
+    specs = (
+        OrthoTaskSpec(str(source), str(output)),
+        OrthoTaskSpec(str(failing), str(output)),
+        OrthoTaskSpec(str(source.with_name("missing.e57")), str(output)),
+    )
+    task_file = tmp_path / "tasks.txt"
+    task_file.write_text("".join(f"{spec.input_pattern}\t{spec.output_parent}\n" for spec in specs),
+                         encoding="utf-8-sig")
+    generate = app.generate_orthophotos
+
+    def fail_one(path, *args):
+        if path == str(failing):
+            raise ValueError("invalid point cloud")
+        return generate(path, *args)
+
+    monkeypatch.setattr(app, "generate_orthophotos", fail_one)
+    worker = app.TaskListGenerationWorker(specs, app.GenerationSettings(), False, False)
+    summaries = []
+    worker.succeeded.connect(summaries.append)
+    worker.run()
+    assert len(calls) == 1
+    assert summaries[0].completed_specs == (specs[0],)
+    assert len(summaries[0].failures) == 2
+
+    messages = []
+    monkeypatch.setattr(app.QMessageBox, "warning", lambda *args: messages.append(args[-1]))
+    window = app.MainWindow()
+    try:
+        window.task_specs = specs
+        window.task_list_path = str(task_file)
+        window.remove_completed_task_items.setChecked(True)
+        window._succeeded(summaries[0])
+        assert app.read_task_list(task_file) == specs[1:]
+        assert window.task_specs == specs[1:]
+        assert "invalid point cloud" in messages[0] and "没有匹配到点云" in messages[0]
+    finally:
+        window.close()
+
+
+def test_partial_group_is_not_removed_after_one_file_fails(cleanup_case, monkeypatch):
+    app, make_source, run, _, _ = cleanup_case
+    source, _ = make_source()
+    failing = source.with_name("failing.e57")
+    failing.touch()
+    generate = app.generate_orthophotos
+
+    def fail_one(path, *args):
+        if path == str(failing):
+            raise ValueError("generation failed")
+        return generate(path, *args)
+
+    monkeypatch.setattr(app, "generate_orthophotos", fail_one)
+    summary = run(source, remove=False, pattern=str(source.with_name("*.e57")))[0][0]
+    assert len(summary.results) == 1 and len(summary.failures) == 1
+    assert not summary.completed_specs
+    assert source.exists() and failing.exists()
+
+
+def test_task_low_space_preserves_pending_input_and_completion_state(cleanup_case, monkeypatch):
+    app, make_source, run, _, calls = cleanup_case
+    source, description = make_source()
+    monkeypatch.setattr(app, "has_safe_free_space", lambda _: (False, 9 * 1024**3))
+
+    summary = run(source)[0][0]
+
+    assert not calls and summary.stopped_reason
+    assert not summary.results and not summary.completed_specs and not summary.cleaned_sources
+    assert source.exists() and description.exists()
+
+
+def test_ui_retains_log_history_without_file_access(cleanup_case, monkeypatch):
+    app, _, _, _, _ = cleanup_case
+    messages = []
+    monkeypatch.setattr(app.QMessageBox, "warning", lambda *args: messages.append(args[-1]))
+    window = app.MainWindow()
+    try:
+        assert set(window.findChildren(app.QPlainTextEdit)) == {window.source_edit, window.log}
+        assert window.log.isReadOnly()
+
+        def deny_file_access(*args, **kwargs):
+            pytest.fail("UI logging must not read or write files")
+
+        monkeypatch.setattr("builtins.open", deny_file_access)
+        monkeypatch.setattr("io.open", deny_file_access)
+        window._progressed("first input", 10)
+        window._progressed("second input", 60)
+        assert window.status_label.text() == "second input"
+        assert window.progress.value() == 60
+        assert "first input" in window.log.toPlainText()
+        assert "second input" in window.log.toPlainText()
+        window._failed("failed to read input")
+        assert messages == ["failed to read input"]
+        assert "failed to read input" in window.status_label.text()
+        assert "failed to read input" in window.log.toPlainText()
+        assert window.generate_button.isEnabled() and not window.cancel_button.isEnabled()
+    finally:
+        window.close()
 
 
 def test_cleanup_rejects_unrelated_file_types(tmp_path):

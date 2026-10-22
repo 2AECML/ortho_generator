@@ -15,6 +15,7 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 from scipy import ndimage
+from scipy.spatial import cKDTree
 import tifffile
 
 from .cancellation import CancellationToken, ProcessingCancelledError
@@ -54,7 +55,12 @@ class GenerationSettings:
     display_min: float | None = None
     display_max: float | None = None
     maximum_display_interpolation_distance_m: float = 0.0075
+    adaptive_display_interpolation: bool = True
+    adaptive_display_interpolation_limit_m: float = 0.015
+    maximum_display_hole_area_pixels: int = 25
+    display_interpolation_method: str = "idw"
     suppress_display_impulses: bool = True
+    repair_display_dark_speckles: bool = True
     las_depth_aware_display: bool = True
     maximum_las_display_relative_depth_m: float = 2.0
     las_display_depth_cluster_m: float = 0.03
@@ -122,6 +128,21 @@ class GenerationSettings:
             raise ValueError("最大显示插值距离必须是有限非负数。")
         if self.fit_sample_count < 1_000 or self.maximum_image_pixels < 1:
             raise ValueError("拟合样本数或单图像素上限无效。")
+        if (
+            not np.isfinite(self.adaptive_display_interpolation_limit_m)
+            or self.adaptive_display_interpolation_limit_m < 0
+        ):
+            raise ValueError("自适应补孔上限必须是有限非负数。")
+        if (
+            self.adaptive_display_interpolation
+            and self.maximum_display_interpolation_distance_m > 0
+            and self.adaptive_display_interpolation_limit_m < self.maximum_display_interpolation_distance_m
+        ):
+            raise ValueError("自适应补孔上限不能小于基础插值距离。")
+        if self.maximum_display_hole_area_pixels < 1:
+            raise ValueError("小孔面积上限必须至少为 1 像素。")
+        if self.display_interpolation_method not in ("nearest", "idw"):
+            raise ValueError("补孔方式必须为 nearest 或 idw。")
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,19 +443,19 @@ def _read_with_halo(array: np.ndarray, destination, halo: int):
     return block, core
 
 
-def _bounded_internal_empty_column_groups(
-    column_support: np.ndarray,
+def _bounded_internal_empty_groups(
+    support: np.ndarray,
     radius: float,
 ):
-    """Yield narrow empty column runs bracketed by observed columns."""
-    empty_columns = np.flatnonzero(~np.asarray(column_support, dtype=bool))
+    """Yield narrow empty runs bracketed by observations along either axis."""
+    empty_columns = np.flatnonzero(~np.asarray(support, dtype=bool))
     for group in np.split(
         empty_columns, np.flatnonzero(np.diff(empty_columns) > 1) + 1
     ):
         if not len(group):
             continue
         left, right = int(group[0]) - 1, int(group[-1]) + 1
-        if left < 0 or right >= len(column_support):
+        if left < 0 or right >= len(support):
             continue
         if np.ceil(len(group) / 2) > radius + 1e-9:
             continue
@@ -448,6 +469,11 @@ def _build_small_hole_mask(
     maximum_distance_m: float,
     token: CancellationToken,
     allow_scanline_gaps: bool = False,
+    *,
+    allow_scanrow_gaps: bool = False,
+    adaptive: bool = False,
+    adaptive_limit_m: float = 0.015,
+    maximum_hole_area_pixels: int = 25,
 ) -> np.memmap:
     """Port of EasyTry's bounded display-only small-hole policy."""
     output = np.lib.format.open_memmap(
@@ -458,12 +484,34 @@ def _build_small_hole_mask(
     if radius <= 0:
         output.flush()
         return output
-    halo = int(np.ceil(radius)) + 2
+    limit_radius = adaptive_limit_m / pixel_size_m if adaptive else radius
+    row_gaps = tuple(_bounded_internal_empty_groups(
+        np.any(valid_mask, axis=1), limit_radius,
+    )) if allow_scanrow_gaps else ()
+    # Include the density window and complete small-hole boundary across tiles.
+    halo = int(np.ceil(limit_radius)) * 2 + 16 if adaptive else int(np.ceil(radius)) + 2
     for destination in _tiles(valid_mask.shape):
         token.throw_if_cancelled()
         block, core = _read_with_halo(valid_mask, destination, halo)
         valid = block.astype(bool)
-        enclosed = ndimage.binary_fill_holes(valid) & ~valid
+        row_targets = np.zeros(valid.shape, dtype=bool)
+        block_row0 = destination[0].start - core[0].start
+        block_column0 = destination[1].start - core[1].start
+        block_column1 = block_column0 + block.shape[1]
+        for group, above, below in row_gaps:
+            inside = group[(group >= block_row0) & (group < block_row0 + block.shape[0])]
+            if not len(inside):
+                continue
+            bracketed = (
+                (valid_mask[above, block_column0:block_column1] > 0)
+                & (valid_mask[below, block_column0:block_column1] > 0)
+            )
+            row_targets[np.ix_(inside - block_row0, np.flatnonzero(bracketed))] = True
+        # Close only bracketed rasterization rows for hole topology. Small
+        # dropouts attached to those rows then become enclosed candidates too.
+        # Distances and density still use real observations, never inferred data.
+        topology_valid = valid | row_targets
+        enclosed = ndimage.binary_fill_holes(topology_valid) & ~topology_valid
         distance = ndimage.distance_transform_edt(~valid)
         labels, label_count = ndimage.label(enclosed)
         if label_count:
@@ -472,17 +520,37 @@ def _build_small_hole_mask(
                 distance, labels=labels, index=label_ids
             )
             accepted = label_ids[maximum_distance <= radius + 1e-9]
+            if adaptive:
+                # Occupied-cell fraction estimates spacing in the unfolded plane.
+                # This is a display heuristic, not a measurement of XYZ accuracy.
+                density = ndimage.uniform_filter(valid.astype(np.float32), size=31, mode="nearest")
+                local_radius = np.minimum(
+                    limit_radius,
+                    np.maximum(radius, 2.0 / np.sqrt(np.maximum(density, 0.05))),
+                )
+                allowed = ndimage.minimum(local_radius, labels=labels, index=label_ids)
+                areas = np.bincount(labels.ravel(), minlength=label_count + 1)[1:]
+                accepted = label_ids[
+                    (maximum_distance <= allowed + 1e-9)
+                    & (areas <= maximum_hole_area_pixels)
+                ]
+                bounds = ndimage.find_objects(labels)
+                accepted = np.asarray([
+                    label_id for label_id in accepted
+                    if max(s.stop - s.start for s in bounds[label_id - 1])
+                    <= 2 * allowed[label_id - 1] + 1
+                ], dtype=np.int32)
             fillable = np.isin(labels, accepted)
         else:
             fillable = np.zeros(valid.shape, dtype=bool)
-        output[destination] = fillable[core].astype(np.uint8)
+        output[destination] = (fillable | row_targets)[core].astype(np.uint8)
     if allow_scanline_gaps:
         # A missing scan column touches the top/bottom image boundary, so it is
         # not an enclosed hole. Fill only narrow INTERNAL gaps bracketed by
         # real display support on both sides, never boundary/large gaps.
         column_support = np.any(valid_mask, axis=0)
-        for group, left, right in _bounded_internal_empty_column_groups(
-            column_support, radius
+        for group, left, right in _bounded_internal_empty_groups(
+            column_support, limit_radius
         ):
             bracketed = (valid_mask[:, left] > 0) & (valid_mask[:, right] > 0)
             output[np.ix_(np.flatnonzero(bracketed), group)] = 1
@@ -507,18 +575,29 @@ def _build_display_raster(
     token: CancellationToken,
     suppress_impulses: bool = True,
     foreground_depth: np.ndarray | None = None,
+    *,
+    allow_scanrow_gaps: bool = False,
+    interpolation_method: str = "nearest",
+    depth_tolerance_m: float = 0.03,
 ) -> tuple[np.ndarray, int]:
+    if interpolation_method not in ("nearest", "idw"):
+        raise ValueError("补孔方式必须为 nearest 或 idw。")
     display = np.zeros(field.shape, dtype=np.uint8)
     suppressed_count = 0
     halo = max(2, int(np.ceil(maximum_distance_m / pixel_size_m)) + 2)
     radius = maximum_distance_m / pixel_size_m
     column_support = np.zeros(field.shape[1], dtype=bool)
+    row_support = np.zeros(field.shape[0], dtype=bool) if allow_scanrow_gaps else None
     for row0 in range(0, field.shape[0], 512):
         row1 = min(field.shape[0], row0 + 512)
-        column_support |= np.any(np.isfinite(field[row0:row1]), axis=0)
+        valid = np.isfinite(field[row0:row1])
+        column_support |= np.any(valid, axis=0)
+        if row_support is not None:
+            row_support[row0:row1] = np.any(valid, axis=1)
     scanline_gaps = tuple(
-        _bounded_internal_empty_column_groups(column_support, radius)
+        _bounded_internal_empty_groups(column_support, radius)
     )
+    scanrow_gaps = tuple(_bounded_internal_empty_groups(row_support, radius)) if row_support is not None else ()
     lower, upper = limits
     for destination in _tiles(field.shape):
         token.throw_if_cancelled()
@@ -527,9 +606,14 @@ def _build_display_raster(
             interpolation_mask, destination, halo
         )
         source_valid = np.isfinite(values)
+        depth_block = (
+            _read_with_halo(foreground_depth, destination, halo)[0]
+            if foreground_depth is not None else None
+        )
         working = values.astype(np.float64, copy=True)
         fill_target = interpolation.astype(bool) & ~source_valid
         linear_filled = np.zeros(fill_target.shape, dtype=bool)
+        scanline_targets = np.zeros(fill_target.shape, dtype=bool)
         row_slice, column_slice = destination
         block_row0 = max(0, row_slice.start - halo)
         block_row1 = min(field.shape[0], row_slice.stop + halo)
@@ -544,7 +628,15 @@ def _build_display_raster(
             bracketed = np.isfinite(left_values) & np.isfinite(right_values)
             for column in inside:
                 local_column = int(column) - block_column0
+                scanline_targets[:, local_column] = fill_target[:, local_column]
                 take = bracketed & fill_target[:, local_column]
+                if interpolation_method == "idw":
+                    # Do not bridge strong radiometric or depth discontinuities.
+                    take &= np.abs(left_values - right_values) <= (upper - lower) * (80.0 / 255.0)
+                    if foreground_depth is not None:
+                        ld = np.asarray(foreground_depth[block_row0:block_row1, left])
+                        rd = np.asarray(foreground_depth[block_row0:block_row1, right])
+                        take &= np.isfinite(ld) & np.isfinite(rd) & (np.abs(ld - rd) <= depth_tolerance_m)
                 if not np.any(take):
                     continue
                 right_weight = (int(column) - left) / (right - left)
@@ -553,14 +645,96 @@ def _build_display_raster(
                     + right_values[take] * right_weight
                 )
                 linear_filled[take, local_column] = True
+        for group, above, below in scanrow_gaps:
+            inside = group[(group >= block_row0) & (group < block_row1)]
+            if not len(inside):
+                continue
+            above_values = np.asarray(field[above, block_column0:block_column1])
+            below_values = np.asarray(field[below, block_column0:block_column1])
+            bracketed = np.isfinite(above_values) & np.isfinite(below_values)
+            compatible = bracketed & (
+                np.abs(above_values - below_values) <= (upper - lower) * (80.0 / 255.0)
+            )
+            if foreground_depth is not None:
+                ad = np.asarray(foreground_depth[above, block_column0:block_column1])
+                bd = np.asarray(foreground_depth[below, block_column0:block_column1])
+                compatible &= np.isfinite(ad) & np.isfinite(bd) & (np.abs(ad - bd) <= depth_tolerance_m)
+            for row in inside:
+                local_row = int(row) - block_row0
+                # A rejected pair must not fall back to one-sided interpolation.
+                # Unpaired small holes can still use the bounded hole policy.
+                scanline_targets[local_row] |= bracketed & fill_target[local_row]
+                take = compatible & fill_target[local_row]
+                if not np.any(take):
+                    continue
+                below_weight = (int(row) - above) / (below - above)
+                working[local_row, take] = (
+                    above_values[take] * (1.0 - below_weight)
+                    + below_values[take] * below_weight
+                )
+                linear_filled[local_row, take] = True
         nearest_target = fill_target & ~linear_filled
-        if np.any(nearest_target) and np.any(source_valid):
+        nearest_target &= ~scanline_targets
+        filled = linear_filled.copy()
+        if interpolation_method == "idw":
+            if np.any(nearest_target) and np.any(source_valid):
+                source_points = np.column_stack(np.nonzero(source_valid))
+                target_points = np.column_stack(np.nonzero(nearest_target))
+                tree = cKDTree(source_points)
+                source_values = working[source_valid]
+                source_depths = depth_block[source_valid] if depth_block is not None else None
+                for start in range(0, len(target_points), 32768):
+                    token.throw_if_cancelled()
+                    points = target_points[start:start + 32768]
+                    distances, indices = tree.query(
+                        points, k=9, distance_upper_bound=radius + 1e-9,
+                    )
+                    # The eighth neighbour may tie with other samples. Resolve
+                    # ties by row/column so changing tile boundaries cannot alter
+                    # the chosen observations or the reconstructed grey value.
+                    tied = np.isfinite(distances[:, 7]) & (
+                        np.abs(distances[:, 7] - np.where(np.isfinite(distances[:, 8]), distances[:, 8], -1)) < 1e-9
+                    )
+                    distances = distances[:, :8].copy()
+                    indices = indices[:, :8].copy()
+                    for row in np.flatnonzero(tied):
+                        candidates = np.asarray(tree.query_ball_point(
+                            points[row], distances[row, 7] + 1e-9,
+                        ), dtype=np.int64)
+                        squared = np.sum((source_points[candidates] - points[row]) ** 2, axis=1)
+                        order = np.lexsort((candidates, squared))[:8]
+                        indices[row] = candidates[order]
+                        distances[row] = np.sqrt(squared[order])
+                    valid_neighbours = indices < len(source_values)
+                    safe_indices = np.minimum(indices, len(source_values) - 1)
+                    samples = source_values[safe_indices]
+                    sufficient = valid_neighbours.sum(axis=1) >= 3
+                    sample_min = np.min(np.where(valid_neighbours, samples, np.inf), axis=1)
+                    sample_max = np.max(np.where(valid_neighbours, samples, -np.inf), axis=1)
+                    sufficient &= sample_max - sample_min <= (upper - lower) * (80.0 / 255.0)
+                    if source_depths is not None:
+                        depths = source_depths[safe_indices]
+                        valid_depths = valid_neighbours & np.isfinite(depths)
+                        depth_min = np.min(np.where(valid_depths, depths, np.inf), axis=1)
+                        depth_max = np.max(np.where(valid_depths, depths, -np.inf), axis=1)
+                        sufficient &= (valid_depths.sum(axis=1) == valid_neighbours.sum(axis=1))
+                        sufficient &= depth_max - depth_min <= depth_tolerance_m
+                    weights = np.where(valid_neighbours, 1.0 / np.maximum(distances, 1e-9) ** 2, 0.0)
+                    averaged = np.sum(samples * weights, axis=1) / np.maximum(weights.sum(axis=1), 1e-9)
+                    rr, cc = points[sufficient].T
+                    working[rr, cc] = averaged[sufficient]
+                    filled[rr, cc] = True
+        elif np.any(nearest_target) and np.any(source_valid):
             _, indices = ndimage.distance_transform_edt(
                 ~source_valid, return_indices=True
             )
             working[nearest_target] = working[
                 indices[0][nearest_target], indices[1][nearest_target]
             ]
+            filled |= nearest_target
+        fill_target = filled
+        # Record actual successful fills, including row and edge rejections.
+        interpolation_mask[destination] = filled[core].astype(np.uint8)
         display_valid = source_valid | fill_target
         if upper <= lower:
             mapped = np.where(display_valid, 127, 0).astype(np.uint8)
@@ -616,6 +790,115 @@ def _build_display_raster(
             suppressed_count += int(np.count_nonzero(impulse[core]))
         display[destination] = mapped[core]
     return display, suppressed_count
+
+
+def _repair_display_dark_speckles(
+    display: np.ndarray,
+    token: CancellationToken,
+    *,
+    observed_mask: np.ndarray | None = None,
+    maximum_distance_pixels: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Repair small dark dropouts in display only, preserving known observations.
+
+    Without observation data the mask is inferred from appearance (PNG repair).
+    Generation and auxiliary rebuild always supply the real display support.
+    Component size and tile halos keep long lines and external gaps protected.
+    """
+    if display.ndim != 2 or display.dtype != np.uint8:
+        raise ValueError("黑点修补需要 uint8 灰度图。")
+    if observed_mask is not None and observed_mask.shape != display.shape:
+        raise ValueError("观测掩膜与显示图尺寸不一致。")
+    output = display.copy()
+    changed = np.zeros(display.shape, dtype=np.uint8)
+    if maximum_distance_pixels <= 0:
+        return output, changed
+    import cv2
+
+    radius = min(3.0, maximum_distance_pixels)
+    halo = 9 + 4 + int(np.ceil(radius)) + 2
+    for destination in _tiles(display.shape):
+        token.throw_if_cancelled()
+        block, core = _read_with_halo(display, destination, halo)
+        dark = (block <= 8).astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+        if count <= 1:
+            continue
+        background = cv2.medianBlur(block, 9)
+        area = stats[:, cv2.CC_STAT_AREA]
+        contrast = background.astype(np.int16) - block.astype(np.int16)
+        mean_contrast = np.bincount(
+            labels.ravel(), weights=contrast.ravel(), minlength=count,
+        ) / np.maximum(area, 1)
+        mean_background = np.bincount(
+            labels.ravel(), weights=background.ravel(), minlength=count,
+        ) / np.maximum(area, 1)
+        x, y, width, height, _ = stats.T
+        selected = (
+            (area <= 25) & (width <= 9) & (height <= 9)
+            & (np.maximum(width, height) <= 4 * np.minimum(width, height))
+            & (x > 4) & (y > 4)
+            & (x + width < block.shape[1] - 4)
+            & (y + height < block.shape[0] - 4)
+            & (mean_contrast >= 50) & (mean_background >= 60)
+        )
+        selected[0] = False
+        if not np.any(selected):
+            continue
+        distance = ndimage.distance_transform_edt(dark)
+        maximum_distance = ndimage.maximum(distance, labels=labels, index=np.arange(count))
+        selected &= maximum_distance <= maximum_distance_pixels + 1e-9
+        candidate = selected[labels]
+        if observed_mask is not None:
+            support, _ = _read_with_halo(observed_mask, destination, halo)
+            candidate &= support == 0
+        if not np.any(candidate[core]):
+            continue
+        repaired = cv2.inpaint(block, candidate.astype(np.uint8) * 255, radius, cv2.INPAINT_TELEA)
+        target = candidate[core]
+        np.copyto(output[destination], repaired[core], where=target)
+        changed[destination] = (target & (repaired[core] != block[core])).astype(np.uint8)
+    return output, changed
+
+
+def _display_coverage(field, hits, interpolation, pixel_size_m, token):
+    """Summarize observed/filled/missing pixels without allocating full float copies."""
+    observed = filled = missing = low_support = 0
+    for destination in _tiles(field.shape):
+        token.throw_if_cancelled()
+        valid = np.isfinite(field[destination])
+        observed += int(np.count_nonzero(valid))
+        filled += int(np.count_nonzero(interpolation[destination]))
+        missing += int(np.count_nonzero(~valid & ~interpolation[destination].astype(bool)))
+        low_support += int(np.count_nonzero(valid & (hits[destination] == 1)))
+    total = int(np.prod(field.shape))
+    return {
+        "observed_pixel_count": observed,
+        "interpolated_pixel_count": filled,
+        "remaining_missing_pixel_count": missing,
+        "single_hit_pixel_count": low_support,
+        "observed_fraction": observed / total,
+        "remaining_missing_fraction": missing / total,
+        "pixel_size_m": pixel_size_m,
+    }
+
+
+def _coverage_preview(field, interpolation, limits, token):
+    """Palette diagnostic: red=missing, blue=filled, black=observed low intensity."""
+    classes = np.zeros(field.shape, dtype=np.uint8)
+    lower, upper = limits
+    for destination in _tiles(field.shape):
+        token.throw_if_cancelled()
+        values = np.asarray(field[destination])
+        valid = np.isfinite(values)
+        block = valid.astype(np.uint8)
+        if upper > lower:
+            block[valid & (values <= lower + (upper - lower) * 5.0 / 255.0)] = 3
+        block[interpolation[destination] > 0] = 2
+        classes[destination] = block
+    image = Image.fromarray(classes).convert("P")
+    image.putpalette([255, 70, 70, 180, 180, 180, 0, 150, 255, 0, 0, 0] + [0] * (256 * 3 - 12))
+    return image
 
 
 def _antialias_foreground_edges(
@@ -1072,6 +1355,16 @@ def generate_orthophotos(
         )
         if structured_mapping is not None:
             state["structured_row_mapping"] = structured_mapping
+            state["display_scanrow_resampling"] = {
+                "enabled": cfg.maximum_display_interpolation_distance_m > 0,
+                "method": "bounded_internal_rows_linear_with_edge_protection",
+                "maximum_distance_m": (
+                    cfg.adaptive_display_interpolation_limit_m
+                    if cfg.adaptive_display_interpolation and cfg.maximum_display_interpolation_distance_m > 0
+                    else cfg.maximum_display_interpolation_distance_m
+                ),
+                "scientific_data_modified": False,
+            }
         _atomic_json(manifest_path, state)
 
         emit("第二遍：流式生成大幅正射栅格", 42)
@@ -1217,6 +1510,9 @@ def generate_orthophotos(
                 display_field.flush()
                 _close(display_sums)
             interpolation_path = directory / "_interpolated.npy"
+            interpolation_distance_m = cfg.maximum_display_interpolation_distance_m
+            if cfg.adaptive_display_interpolation and interpolation_distance_m > 0:
+                interpolation_distance_m = cfg.adaptive_display_interpolation_limit_m
             interpolation = _build_small_hole_mask(
                 display_hits,
                 interpolation_path,
@@ -1224,19 +1520,53 @@ def generate_orthophotos(
                 cfg.maximum_display_interpolation_distance_m,
                 token,
                 allow_scanline_gaps=is_las or metadata.structured_indices,
+                allow_scanrow_gaps=metadata.structured_indices,
+                adaptive=cfg.adaptive_display_interpolation,
+                adaptive_limit_m=cfg.adaptive_display_interpolation_limit_m,
+                maximum_hole_area_pixels=cfg.maximum_display_hole_area_pixels,
             )
-            interpolated_pixels = int(np.count_nonzero(interpolation))
-            total_interpolated_pixels += interpolated_pixels
             display_front_depth = np.load(directory / "_depth_max.npy", mmap_mode="r") if depth_display else None
             display, suppressed_pixels = _build_display_raster(
                 display_field,
                 interpolation,
                 (display_min, display_max),
                 effective_pixel_size_m,
-                cfg.maximum_display_interpolation_distance_m,
+                interpolation_distance_m,
                 token,
                 cfg.suppress_display_impulses,
                 display_front_depth,
+                allow_scanrow_gaps=metadata.structured_indices,
+                interpolation_method=cfg.display_interpolation_method,
+                depth_tolerance_m=cfg.las_display_depth_cluster_m,
+            )
+            speckle_enabled = cfg.repair_display_dark_speckles and interpolation_distance_m > 0
+            repaired_speckles = 0
+            if speckle_enabled:
+                display, speckle_mask = _repair_display_dark_speckles(
+                    display, token, observed_mask=display_hits,
+                    maximum_distance_pixels=interpolation_distance_m / effective_pixel_size_m,
+                )
+                repaired_speckles = int(np.count_nonzero(speckle_mask))
+                interpolation[speckle_mask > 0] = 1
+                if cfg.output_auxiliary_data:
+                    Image.fromarray(speckle_mask).save(directory / "display_dark_speckle_mask.png")
+                del speckle_mask
+            speckle_metadata = {
+                "enabled": speckle_enabled,
+                "method": "small_dark_components_v1_telea_missing_only",
+                "modified_pixel_count": repaired_speckles,
+                "scientific_data_modified": False,
+            }
+            state.setdefault("display_dark_speckle_repair", []).append({"image_id": image_id, **speckle_metadata})
+            interpolated_pixels = int(np.count_nonzero(interpolation))
+            total_interpolated_pixels += interpolated_pixels
+            coverage = _display_coverage(display_field, display_hits, interpolation, effective_pixel_size_m, token)
+            state.setdefault("display_coverage", []).append({"image_id": image_id, **coverage})
+            emit(
+                f"{image_id}：真实观测 {coverage['observed_fraction']:.1%}，"
+                f"补孔 {interpolated_pixels:,} 像素（其中小黑孔修补 {repaired_speckles:,} 像素），"
+                f"剩余缺测 {coverage['remaining_missing_fraction']:.1%}",
+                89 + int(index / len(specs) * 10),
             )
             antialias_pixels = 0
             if display_front_depth is not None and cfg.las_edge_antialias_strength > 0:
@@ -1274,6 +1604,9 @@ def generate_orthophotos(
                 Image.fromarray(np.asarray(interpolation)).save(
                     directory / "interpolated_mask.png"
                 )
+                _coverage_preview(display_field, interpolation, (display_min, display_max), token).save(
+                    directory / "coverage_preview.png"
+                )
             image_metadata = {
                 "schema_version": "tunnel-ortho-image-v1",
                 "image_id": image_id,
@@ -1295,11 +1628,23 @@ def generate_orthophotos(
                 "display": state["display"],
                 "display_interpolation": {
                     "method": (
+                        "bounded_adaptive_idw_with_edge_protection"
+                        if cfg.display_interpolation_method == "idw" else
                         "enclosed_small_holes_and_linear_bounded_internal_scanline_gaps"
                         if is_las or metadata.structured_indices
                         else "enclosed_small_holes_nearest_valid"
                     ),
                     "maximum_distance_m": cfg.maximum_display_interpolation_distance_m,
+                    "adaptive": cfg.adaptive_display_interpolation,
+                    "adaptive_limit_m": cfg.adaptive_display_interpolation_limit_m,
+                    "maximum_hole_area_pixels": cfg.maximum_display_hole_area_pixels,
+                    "interpolation_method": cfg.display_interpolation_method,
+                    "allow_scanline_gaps": is_las or metadata.structured_indices,
+                    "allow_scanrow_gaps": metadata.structured_indices,
+                    "depth_tolerance_m": cfg.las_display_depth_cluster_m,
+                    "maximum_neighbours": 8,
+                    "minimum_neighbours": 3,
+                    "maximum_neighbour_contrast_gray": 80,
                     "interpolated_pixel_count": interpolated_pixels,
                     "scientific_data_modified": False,
                 },
@@ -1309,8 +1654,13 @@ def generate_orthophotos(
                     "suppressed_pixel_count": suppressed_pixels,
                     "scientific_data_modified": False,
                 },
+                "display_dark_speckle_repair": speckle_metadata,
                 "ellipse": ellipse.to_dict(),
+                "display_coverage": coverage,
+                "coverage_preview": "coverage_preview.png",
             }
+            if cfg.output_auxiliary_data and speckle_enabled:
+                image_metadata["display_dark_speckle_mask"] = "display_dark_speckle_mask.png"
             if depth_display:
                 image_metadata["display_edge_antialiasing"] = {
                     "method": "depth_gated_coherent_edge_tangent_resampling",

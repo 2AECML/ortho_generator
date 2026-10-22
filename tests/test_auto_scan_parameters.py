@@ -155,7 +155,7 @@ def test_each_batch_input_gets_its_own_metadata_and_missing_field_fallback(
     if task_mode:
         worker = app.TaskListGenerationWorker(
             (OrthoTaskSpec(str(tmp_path / "*.e57"), str(tmp_path / "out")),),
-            str(tmp_path / "tasks.txt"), baseline, True, False,
+            baseline, True, False,
         )
     else:
         worker = app.GenerationWorker(

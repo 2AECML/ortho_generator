@@ -3,3 +3,5 @@ __pycache__/
 *.py[cod]
 native/build/
 logs/
+.test-deps/
+.pytest-temp/

@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -46,15 +47,12 @@ from .sources import create_source
 from .task_list import (
     MINIMUM_FREE_BYTES,
     OrthoTaskSpec,
-    TaskJournal,
     expand_task,
     has_safe_free_space,
-    journal_path_for,
     read_task_list,
     remove_task_specs,
     remove_generated_input,
     require_generated_images,
-    completed_image_outputs,
 )
 
 
@@ -64,7 +62,6 @@ class BatchGenerationSummary:
     results: tuple[tuple[str, GenerationResult], ...]
     failures: tuple[tuple[str, str], ...]
     stopped_reason: str | None = None
-    log_path: str | None = None
     completed_specs: tuple[OrthoTaskSpec, ...] = ()
     cleaned_sources: tuple[str, ...] = ()
 
@@ -177,112 +174,49 @@ class TaskListGenerationWorker(QThread):
     def __init__(
         self,
         specs: tuple[OrthoTaskSpec, ...],
-        task_list_path: str,
         settings: GenerationSettings,
         auto_scanner_revolutions: bool,
         remove_inputs: bool,
     ) -> None:
         super().__init__()
         self.specs = specs
-        self.task_list_path = task_list_path
         self.settings = settings
         self.auto_scanner_revolutions = auto_scanner_revolutions
         self.remove_inputs = remove_inputs
         self.token = CancellationToken()
 
     def run(self) -> None:
-        journal = TaskJournal(journal_path_for(self.task_list_path))
         try:
             expanded: list[tuple[str, str]] = []
             expanded_by_spec: dict[OrthoTaskSpec, tuple[str, ...]] = {}
             failures: list[tuple[str, str]] = []
-            completed = journal.completed()
-            generated = journal.keys_with_status("GENERATED")
-            known_images = journal.generated_images()
-            output_images: dict[str, dict[str, tuple[str, ...]]] = {}
-            cleanup_failures: set[tuple[str, str]] = set()
+            completed: set[tuple[str, str]] = set()
             cleaned_sources: list[str] = []
             for spec in self.specs:
                 sources = expand_task(spec)
-                if self.remove_inputs:
-                    orphaned = tuple(
-                        source for source in journal.matching_sources(spec, ("GENERATED", "SUCCESS"))
-                        if not Path(source).exists()
-                        and Path(source).with_name(f"{Path(source).stem}_扫描说明.txt").is_file()
-                    )
-                    sources = tuple(dict.fromkeys((*sources, *orphaned)))
                 expanded_by_spec[spec] = sources
                 if not sources:
-                    if self.remove_inputs and journal.matching_sources(spec, ("SUCCESS",)):
-                        self.progressed.emit(
-                            f"已完成并清理的任务组：{spec.input_pattern}", 0
-                        )
-                        continue
-                    message = f"没有匹配到点云：{spec.input_pattern}"
-                    failures.append((spec.input_pattern, message))
-                    journal.append("NO_MATCH", spec.input_pattern, spec.output_parent, message)
+                    failures.append((spec.input_pattern, f"没有匹配到点云：{spec.input_pattern}"))
                     continue
                 expanded.extend((source, spec.output_parent) for source in sources)
 
-            pending = [
-                item for item in expanded
-                if (str(Path(item[0]).resolve()).casefold(), str(Path(item[1]).resolve()).casefold())
-                not in completed or self.remove_inputs
-            ]
-            skipped = len(expanded) - len(pending)
-            if skipped:
-                self.progressed.emit(f"根据执行日志跳过 {skipped} 个已成功点云。", 0)
-
             results: list[tuple[str, GenerationResult]] = []
             stopped_reason: str | None = None
-            total = len(pending)
-            for index, (source, output) in enumerate(pending, start=1):
+            total = len(expanded)
+            for index, (source, output) in enumerate(expanded, start=1):
                 self.token.throw_if_cancelled()
-                task_key = (
-                    str(Path(source).resolve()).casefold(),
-                    str(Path(output).resolve()).casefold(),
-                )
-                if self.remove_inputs and task_key in (generated | completed):
-                    try:
-                        image_paths = known_images.get(task_key)
-                        if image_paths is None:
-                            if task_key[1] not in output_images:
-                                output_images[task_key[1]] = completed_image_outputs(output)
-                            image_paths = output_images[task_key[1]].get(task_key[0], ())
-                        require_generated_images(image_paths)
-                        self.token.throw_if_cancelled()
-                        removed = remove_generated_input(source)
-                        cleaned_sources.append(source)
-                        journal.append("REMOVED", source, output, "；".join(removed))
-                        journal.append("SUCCESS", source, output, "恢复流程仅完成输入清理")
-                        self.progressed.emit(
-                            f"[{index}/{max(1, total)}] 已根据日志完成遗留输入清理。",
-                            int(index / max(1, total) * 100),
-                        )
-                        continue
-                    except ProcessingCancelledError:
-                        raise
-                    except Exception as error:
-                        message = f"历史成图任务的输入清理失败：{error}"
-                        failures.append((source, message))
-                        cleanup_failures.add(task_key)
-                        journal.append("CLEANUP_FAILED", source, output, message)
-                        self.progressed.emit(message, int(index / max(1, total) * 100))
-                        continue
                 safe, free = has_safe_free_space(output)
                 if not safe:
                     stopped_reason = (
                         f"输出盘剩余空间 {free / 1024**3:.2f} GB，低于安全余量 "
                         f"{MINIMUM_FREE_BYTES / 1024**3:.0f} GB，已停止。"
                     )
-                    journal.append("STOP_NO_SPACE", source, output, stopped_reason)
                     break
 
-                Path(output).mkdir(parents=True, exist_ok=True)
-                journal.append("START", source, output)
                 settings = replace(self.settings)
                 low_space = False
                 try:
+                    Path(output).mkdir(parents=True, exist_ok=True)
                     description = None
                     try:
                         description = read_scanner_description(source)
@@ -295,9 +229,9 @@ class TaskListGenerationWorker(QThread):
                         )
                     if self.auto_scanner_revolutions and description is not None:
                         self.progressed.emit(
-                            f"[{index}/{max(1, total)}] {Path(source).name}：根据 "
+                            f"[{index}/{total}] {Path(source).name}：根据 "
                             f"{description.path.name} 设定 {scanner_parameter_summary(description)}",
-                            int((index - 1) / max(1, total) * 100),
+                            int((index - 1) / total * 100),
                         )
 
                     def report(message: str, percent: int) -> None:
@@ -307,78 +241,59 @@ class TaskListGenerationWorker(QThread):
                             low_space = True
                             self.token.cancel()
                         self.progressed.emit(
-                            f"[{index}/{max(1, total)}] {Path(source).name}：{message}",
-                            min(99, int(((index - 1) + percent / 100.0) / max(1, total) * 100)),
+                            f"[{index}/{total}] {Path(source).name}：{message}",
+                            min(99, int(((index - 1) + percent / 100.0) / total * 100)),
                         )
 
-                    result = generate_orthophotos(
-                        source, output, settings, self.token, report
-                    )
+                    result = generate_orthophotos(source, output, settings, self.token, report)
                     require_generated_images(result.image_paths)
                     results.append((source, result))
-                    journal.record_generated(source, output, result.image_paths)
                     if self.remove_inputs:
                         self.token.throw_if_cancelled()
                         try:
-                            removed = remove_generated_input(source)
+                            remove_generated_input(source)
                             cleaned_sources.append(source)
-                            journal.append("REMOVED", source, output, "；".join(removed))
                             self.progressed.emit(
-                                f"[{index}/{max(1, total)}] 已移除输入点云及扫描说明。",
-                                int(index / max(1, total) * 100),
+                                f"[{index}/{total}] 已移除输入点云及扫描说明。",
+                                int(index / total * 100),
                             )
                         except Exception as error:
                             message = f"影像已生成，但移除输入失败：{error}"
                             failures.append((source, message))
-                            cleanup_failures.add(task_key)
-                            journal.append("CLEANUP_FAILED", source, output, message)
-                            self.progressed.emit(message, int(index / max(1, total) * 100))
+                            self.progressed.emit(message, int(index / total * 100))
                             continue
-                    journal.append("SUCCESS", source, output, f"生成 {len(result.image_paths)} 幅影像")
+                    completed.add((
+                        str(Path(source).resolve()).casefold(),
+                        str(Path(output).resolve()).casefold(),
+                    ))
                 except ProcessingCancelledError:
                     if low_space:
                         _, free = has_safe_free_space(output)
                         stopped_reason = f"输出盘剩余空间不足（{free / 1024**3:.2f} GB），已安全停止。"
-                        journal.append("STOP_NO_SPACE", source, output, stopped_reason)
                         break
                     raise
                 except Exception as error:
                     failures.append((source, str(error)))
-                    journal.append("FAILED", source, output, str(error))
                     self.progressed.emit(
-                        f"[{index}/{max(1, total)}] {Path(source).name} 失败：{error}",
-                        int(index / max(1, total) * 100),
+                        f"[{index}/{total}] {Path(source).name} 失败：{error}",
+                        int(index / total * 100),
                     )
 
-            output_parent = self.specs[-1].output_parent if self.specs else ""
-            final_completed = journal.completed() - cleanup_failures
             completed_specs = tuple(
-                spec
-                for spec, sources in expanded_by_spec.items()
-                if (
-                    sources
-                    and all(
-                        (
-                            str(Path(source).resolve()).casefold(),
-                            str(Path(spec.output_parent).resolve()).casefold(),
-                        ) in final_completed
-                        for source in sources
-                    )
-                )
-                or (
-                    not sources
-                    and self.remove_inputs
-                    and journal.matching_sources(spec, ("SUCCESS",))
+                spec for spec, sources in expanded_by_spec.items()
+                if sources and all(
+                    (str(Path(source).resolve()).casefold(),
+                     str(Path(spec.output_parent).resolve()).casefold()) in completed
+                    for source in sources
                 )
             )
             self.succeeded.emit(BatchGenerationSummary(
-                output_parent,
-                tuple(results),
-                tuple(failures),
-                stopped_reason,
-                str(journal.path),
-                completed_specs,
-                tuple(cleaned_sources),
+                output_parent=self.specs[-1].output_parent if self.specs else "",
+                results=tuple(results),
+                failures=tuple(failures),
+                stopped_reason=stopped_reason,
+                completed_specs=completed_specs,
+                cleaned_sources=tuple(cleaned_sources),
             ))
         except Exception as error:
             self.failed.emit(str(error))
@@ -627,15 +542,49 @@ class MainWindow(QMainWindow):
         self.interpolation_distance.setValue(7.5)
         self.interpolation_distance.setSuffix(" mm")
         self.interpolation_distance.setToolTip(
-            "只填补封闭小孔；0 表示关闭。科学强度与观测掩膜始终不修改。"
+            "基础补孔距离；0 表示关闭所有补孔。处理小孔及有双侧观测的内部窄空行、窄空列。"
         )
         display_form.addRow("显示小孔最大插值距离", self.interpolation_distance)
+        self.adaptive_interpolation = QCheckBox("根据局部观测密度调整小孔填补范围")
+        self.adaptive_interpolation.setChecked(True)
+        self.adaptive_interpolation.setToolTip(
+            "根据 31×31 邻域覆盖率估计采样间距，受距离、面积及孔洞尺寸上限约束；不恢复真实缺测。"
+        )
+        display_form.addRow("自适应补孔", self.adaptive_interpolation)
+        self.adaptive_interpolation_limit = QDoubleSpinBox()
+        self.adaptive_interpolation_limit.setRange(7.5, 100.0)
+        self.adaptive_interpolation_limit.setDecimals(1)
+        self.adaptive_interpolation_limit.setValue(15.0)
+        self.adaptive_interpolation_limit.setSuffix(" mm")
+        display_form.addRow("自适应补孔距离上限", self.adaptive_interpolation_limit)
+        self.hole_area_limit = QSpinBox()
+        self.hole_area_limit.setRange(1, 10000)
+        self.hole_area_limit.setValue(25)
+        self.hole_area_limit.setSuffix(" px")
+        display_form.addRow("自适应小孔面积上限", self.hole_area_limit)
+        self.adaptive_interpolation.toggled.connect(self.adaptive_interpolation_limit.setEnabled)
+        self.adaptive_interpolation.toggled.connect(self.hole_area_limit.setEnabled)
+        self.interpolation_distance.valueChanged.connect(self.adaptive_interpolation_limit.setMinimum)
+        self.interpolation_method = QComboBox()
+        self.interpolation_method.addItem("多邻点距离加权（保护灰度/深度边缘）", "idw")
+        self.interpolation_method.addItem("最近邻（旧版方式）", "nearest")
+        display_form.addRow("小孔填补方式", self.interpolation_method)
+        coverage_hint = QLabel("开启辅助输出后，可查看 coverage_preview.png：红色为缺测，蓝色为补孔，黑色为真实低强度。")
+        coverage_hint.setWordWrap(True)
+        display_form.addRow(coverage_hint)
         self.suppress_impulses = QCheckBox("抑制显示图中的孤立亮点/黑点")
         self.suppress_impulses.setChecked(True)
         self.suppress_impulses.setToolTip(
             "只修正显示 PNG 中孤立的单像素脉冲；科学强度、TIFF 与观测掩膜不修改。"
         )
         display_form.addRow("显示杂点处理", self.suppress_impulses)
+        self.repair_dark_speckles = QCheckBox("填补显示图中的零散小黑孔")
+        self.repair_dark_speckles.setChecked(True)
+        self.repair_dark_speckles.setToolTip(
+            "只修补没有真实观测的小黑孔，保留连续线条、大缺口和真实暗色观测。"
+            "仅改变显示 PNG；补孔距离设为 0 时关闭。"
+        )
+        display_form.addRow("缺测黑点修补", self.repair_dark_speckles)
         self.las_depth_display = QCheckBox("启用 LAS 前景深度簇聚合")
         self.las_depth_display.setChecked(True)
         self.las_depth_display.setToolTip(
@@ -687,10 +636,16 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         layout.addWidget(self.progress)
+        self.status_label = QLabel("等待输入")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        log_box = QGroupBox("运行日志")
+        log_layout = QVBoxLayout(log_box)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(80)
-        layout.addWidget(self.log, 1)
+        log_layout.addWidget(self.log)
+        layout.addWidget(log_box, 1)
 
     def _choose_source(self) -> None:
         existing = self._source_paths()
@@ -733,10 +688,9 @@ class MainWindow(QMainWindow):
         self.output_edit.setText(f"由任务清单指定（{len(specs)} 组）")
         self.output_edit.setReadOnly(True)
         self.source_info.setText(
-            f"已载入 {len(specs)} 组自动任务；再次运行将根据执行日志跳过已成功项。"
+            f"已载入 {len(specs)} 组自动任务；将处理本次选择的全部匹配点云。"
         )
         self.log.appendPlainText(f"已载入任务清单：{self.task_list_path}")
-        self.log.appendPlainText(f"执行日志：{journal_path_for(self.task_list_path)}")
 
     def _choose_output(self) -> None:
         if self.task_specs:
@@ -900,7 +854,12 @@ class MainWindow(QMainWindow):
             maximum_display_interpolation_distance_m=(
                 self.interpolation_distance.value() / 1000.0
             ),
+            adaptive_display_interpolation=self.adaptive_interpolation.isChecked(),
+            adaptive_display_interpolation_limit_m=self.adaptive_interpolation_limit.value() / 1000.0,
+            maximum_display_hole_area_pixels=self.hole_area_limit.value(),
+            display_interpolation_method=self.interpolation_method.currentData(),
             suppress_display_impulses=self.suppress_impulses.isChecked(),
+            repair_display_dark_speckles=self.repair_dark_speckles.isChecked(),
             las_depth_aware_display=self.las_depth_display.isChecked(),
             maximum_las_display_relative_depth_m=self.las_max_depth.value(),
             las_display_depth_cluster_m=self.las_cluster.value() / 1000.0,
@@ -916,15 +875,13 @@ class MainWindow(QMainWindow):
                     raise ValueError("任务清单路径无效。")
                 self.worker = TaskListGenerationWorker(
                     self.task_specs,
-                    self.task_list_path,
                     settings,
                     self.auto_scanner_revolutions.isChecked(),
                     self.remove_input_after_success.isChecked(),
                 )
                 self.progress.setValue(0)
-                self.log.appendPlainText(
-                    f"自动任务：{len(self.task_specs)} 组；执行日志将用于断点续作。"
-                )
+                self.status_label.setText(f"正在准备 {len(self.task_specs)} 组自动任务…")
+                self.log.appendPlainText(f"自动任务：{len(self.task_specs)} 组。")
                 self.worker.progressed.connect(self._progressed)
                 self.worker.succeeded.connect(self._succeeded)
                 self.worker.failed.connect(self._failed)
@@ -948,6 +905,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "参数错误", str(error))
             return
         self.progress.setValue(0)
+        self.status_label.setText(f"正在准备 {len(sources)} 个点云…")
         self.log.appendPlainText(f"批量输入：{len(sources)} 个点云")
         for source in sources:
             self.log.appendPlainText(f"  {source}")
@@ -968,14 +926,15 @@ class MainWindow(QMainWindow):
 
     def _progressed(self, message: str, percent: int) -> None:
         self.progress.setValue(percent)
+        self.status_label.setText(message)
         self.log.appendPlainText(f"{percent:3d}%  {message}")
 
     def _succeeded(self, summary: BatchGenerationSummary) -> None:
-        self.progress.setValue(100)
+        if not summary.stopped_reason:
+            self.progress.setValue(100)
         self.last_output = summary.output_parent
-        total_images = 0
+        total_images = sum(len(result.image_paths) for _, result in summary.results)
         for source, result in summary.results:
-            total_images += len(result.image_paths)
             image_directory = (
                 Path(result.image_paths[0]).parent
                 if result.image_paths
@@ -990,19 +949,17 @@ class MainWindow(QMainWindow):
             )
         if summary.results and "expected_diameter_m" not in self._scanner_preview_baseline:
             self.diameter.setValue(summary.results[-1][1].estimated_diameter_m)
+        errors = [f"{source}：{error}" for source, error in summary.failures]
         for source, error in summary.failures:
             self.log.appendPlainText(f"失败 {Path(source).name}：{error}")
-        if summary.log_path:
-            self.log.appendPlainText(f"执行日志：{summary.log_path}")
+        removed = 0
         if (
             self.remove_completed_task_items.isChecked()
             and self.task_list_path
             and summary.completed_specs
         ):
             try:
-                removed = remove_task_specs(
-                    self.task_list_path, summary.completed_specs
-                )
+                removed = remove_task_specs(self.task_list_path, summary.completed_specs)
                 completed = set(summary.completed_specs)
                 self.task_specs = tuple(
                     spec for spec in self.task_specs if spec not in completed
@@ -1012,31 +969,37 @@ class MainWindow(QMainWindow):
                 )
                 self.log.appendPlainText(f"已从任务清单移除 {removed} 个完成项。")
             except Exception as error:
+                errors.append(f"从任务清单移除完成项失败：{error}")
                 self.log.appendPlainText(f"从任务清单移除完成项失败：{error}")
-        if summary.stopped_reason:
-            self.log.appendPlainText("已停止：" + summary.stopped_reason)
         self.generate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.remove_completed_task_items.setEnabled(True)
         self.open_button.setEnabled(bool(summary.results or summary.cleaned_sources))
         message = (
-            f"批量处理完成：{len(summary.results)} 个成功，"
+            f"批量处理完成：{len(summary.results)} 个已成图，"
             f"{len(summary.failures)} 个失败，共生成 {total_images} 幅影像。"
         )
+        self.status_label.setText(summary.stopped_reason or message)
+        self.log.appendPlainText(message)
         if summary.cleaned_sources:
             message += f"\n已清理 {len(summary.cleaned_sources)} 个输入点云及对应扫描说明。"
+        if removed:
+            message += f"\n已从任务清单移除 {removed} 个完成项。"
+        if errors:
+            message += "\n\n失败原因：\n" + "\n".join(errors)
         if summary.stopped_reason:
+            self.log.appendPlainText("已停止：" + summary.stopped_reason)
             QMessageBox.warning(
-                self,
-                "空间不足，流程已停止",
-                message + "\n" + summary.stopped_reason + "\n释放空间后重新载入同一清单即可继续。",
+                self, "空间不足，流程已停止",
+                message + "\n" + summary.stopped_reason + "\n释放空间后可重新选择未完成的任务。",
             )
-        elif summary.failures:
-            QMessageBox.warning(self, "批量成图完成", message + "\n请查看日志中的失败原因。")
+        elif errors:
+            QMessageBox.warning(self, "批量成图完成", message)
         else:
             QMessageBox.information(self, "批量成图完成", message)
 
     def _failed(self, message: str) -> None:
+        self.status_label.setText("成图未完成：" + message)
         self.log.appendPlainText("失败：" + message)
         self.generate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
@@ -1046,6 +1009,7 @@ class MainWindow(QMainWindow):
     def _cancel(self) -> None:
         if self.worker is not None:
             self.worker.token.cancel()
+            self.status_label.setText("正在安全取消…")
             self.log.appendPlainText("正在安全取消…")
 
     def _open_output(self) -> None:

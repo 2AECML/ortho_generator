@@ -20,6 +20,7 @@ from ortho_generator.service import (
     _close,
     _longitudinal_columns,
     _longitudinal_positions,
+    _repair_display_dark_speckles,
     generate_orthophotos,
     read_scanner_description,
     read_scanner_revolutions,
@@ -237,6 +238,141 @@ def test_internal_scanline_gap_uses_linear_longitudinal_resampling(tmp_path: Pat
     _close(interpolation)
 
 
+def test_scanrow_resampling_closes_attached_dropouts_but_preserves_real_gaps(tmp_path: Path) -> None:
+    rr, cc = np.indices((49, 51))
+    field = (0.35 + rr * 0.004 + cc * 0.001).astype(np.float32)
+    field[0] = np.nan
+    field[20] = np.nan
+    field[19, 25] = np.nan  # This dropout was open to the full-width empty row.
+    field[32:40] = np.nan
+    field[6:9, :3] = np.nan
+    field[10:13, 35:38] = 0  # A measured dark feature must survive.
+    before = field.copy()
+    hits = np.isfinite(field).astype(np.uint32)
+    mask = _build_small_hole_mask(
+        hits, tmp_path / "scanrows.npy", 0.005, 0.0075, CancellationToken(),
+        allow_scanrow_gaps=True, adaptive=True,
+    )
+    display, _ = _build_display_raster(
+        field, mask, (0, 1), 0.005, 0.015, CancellationToken(), False,
+        allow_scanrow_gaps=True, interpolation_method="idw",
+    )
+    assert np.all(display[20] > 0)
+    assert display[19, 25] > 0
+    assert np.all(mask[20] == 1)
+    assert mask[19, 25] == 1
+    assert not np.any(display[0])
+    assert not np.any(display[32:40])
+    assert not np.any(display[6:9, :3])
+    assert not np.any(display[10:13, 35:38])
+    assert np.array_equal(field, before, equal_nan=True)
+    assert np.array_equal(hits, np.isfinite(before).astype(np.uint32))
+    _close(mask)
+
+
+def test_scanrow_resampling_protects_intensity_and_depth_edges_for_both_methods(tmp_path: Path) -> None:
+    for method in ("nearest", "idw"):
+        field = np.full((33, 35), 0.5, dtype=np.float32)
+        field[:16, :12], field[17:, :12] = 0.1, 0.9
+        field[16] = np.nan
+        depth = np.zeros_like(field)
+        depth[17:, 24:] = 0.2
+        mask = _build_small_hole_mask(
+            np.isfinite(field), tmp_path / f"scanrow-edge-{method}.npy",
+            0.005, 0.0075, CancellationToken(), allow_scanrow_gaps=True, adaptive=True,
+        )
+        display, _ = _build_display_raster(
+            field, mask, (0, 1), 0.005, 0.015, CancellationToken(), False, depth,
+            allow_scanrow_gaps=True, interpolation_method=method,
+        )
+        assert not np.any(display[16, :12])
+        assert not np.any(display[16, 24:])
+        assert np.all(display[16, 12:24] == 128)
+        assert not np.any(mask[16, :12])
+        assert not np.any(mask[16, 24:])
+        assert np.all(mask[16, 12:24] == 1)
+        _close(mask)
+
+
+def test_scanrow_resampling_is_opt_in_and_zero_distance_disables_it(tmp_path: Path) -> None:
+    field = np.full((21, 23), 0.5, dtype=np.float32)
+    field[10] = np.nan
+    for enabled, distance in ((False, 0.0075), (True, 0.0)):
+        mask = _build_small_hole_mask(
+            np.isfinite(field), tmp_path / f"scanrow-disabled-{enabled}.npy",
+            0.005, distance, CancellationToken(), allow_scanrow_gaps=enabled,
+            adaptive=True,
+        )
+        display, _ = _build_display_raster(
+            field, mask, (0, 1), 0.005, distance, CancellationToken(), False,
+            allow_scanrow_gaps=enabled, interpolation_method="idw",
+        )
+        assert not np.any(mask)
+        assert not np.any(display[10])
+        _close(mask)
+
+
+def test_dark_speckle_repair_preserves_observations_lines_large_gaps_and_borders() -> None:
+    image = np.full((81, 91), 180, dtype=np.uint8)
+    image[20:22, 20:22] = 0
+    image[30:32, 30:32] = 0
+    image[40:55, 50] = 0
+    image[60:68, 65:73] = 0
+    image[:3, 75:77] = 0
+    support = np.ones(image.shape, dtype=np.uint32)
+    support[20:22, 20:22] = 0
+    support[40:55, 50] = 0
+    support[60:68, 65:73] = 0
+    support[:3, 75:77] = 0
+    before = image.copy()
+    repaired, mask = _repair_display_dark_speckles(
+        image, CancellationToken(), observed_mask=support,
+    )
+    assert np.all(repaired[20:22, 20:22] > 150)
+    assert np.count_nonzero(mask) == 4
+    assert np.array_equal(repaired[mask == 0], image[mask == 0])
+    assert not np.any(repaired[30:32, 30:32])
+    assert not np.any(repaired[40:55, 50])
+    assert not np.any(repaired[60:68, 65:73])
+    assert not np.any(repaired[:3, 75:77])
+    assert np.array_equal(image, before)
+    # Image-only processing infers candidates when no observation mask exists.
+    inferred, _ = _repair_display_dark_speckles(image, CancellationToken())
+    assert np.all(inferred[30:32, 30:32] > 150)
+
+
+def test_dark_speckle_repair_obeys_physical_distance_and_zero_disables_it() -> None:
+    image = np.full((31, 33), 180, dtype=np.uint8)
+    image[14:17, 15:18] = 0
+    for distance in (0.0, 1.5):
+        repaired, mask = _repair_display_dark_speckles(
+            image, CancellationToken(), maximum_distance_pixels=distance,
+        )
+        assert np.array_equal(repaired, image)
+        assert not np.any(mask)
+    repaired, mask = _repair_display_dark_speckles(
+        image, CancellationToken(), maximum_distance_pixels=3,
+    )
+    assert np.count_nonzero(mask) == 9
+    assert np.all(repaired[14:17, 15:18] > 150)
+
+
+def test_dark_speckle_repair_matches_across_tile_boundaries(monkeypatch) -> None:
+    import ortho_generator.service as service
+
+    rr, cc = np.indices((85, 87))
+    image = (120 + rr // 3 + cc // 4).astype(np.uint8)
+    image[12:15, 16:19] = 0
+    image[38:40, 50:52] = 0
+    image[65:67, 67:69] = 0
+    expected, expected_mask = _repair_display_dark_speckles(image, CancellationToken())
+    original_tiles = service._tiles
+    monkeypatch.setattr(service, "_tiles", lambda shape: original_tiles(shape, 13, 17))
+    actual, actual_mask = _repair_display_dark_speckles(image, CancellationToken())
+    assert np.array_equal(actual_mask, expected_mask)
+    assert np.array_equal(actual, expected)
+
+
 def test_display_interpolation_only_selects_enclosed_small_holes(tmp_path: Path) -> None:
     valid = np.ones((30, 30), dtype=np.uint8)
     valid[15, 15] = 0
@@ -253,6 +389,210 @@ def test_display_interpolation_only_selects_enclosed_small_holes(tmp_path: Path)
     assert interpolation[6, 6] == 0
     assert interpolation[0, 20] == 0
     _close(interpolation)
+
+
+def test_adaptive_holes_fill_3x3_but_preserve_large_and_boundary_gaps(tmp_path: Path) -> None:
+    valid = np.ones((63, 63), dtype=np.uint8)
+    valid[10:13, 10:13] = 0
+    valid[25:33, 25:33] = 0
+    valid[:15, 50] = 0
+    before = valid.copy()
+    mask = _build_small_hole_mask(
+        valid, tmp_path / "adaptive.npy", 0.005, 0.0075, CancellationToken(),
+        adaptive=True,
+    )
+    assert np.all(mask[10:13, 10:13] == 1)
+    assert not np.any(mask[25:33, 25:33])
+    assert not np.any(mask[:15, 50])
+    assert np.array_equal(valid, before)
+    _close(mask)
+
+
+def test_adaptive_radius_responds_to_density_and_obeys_physical_cap(tmp_path: Path) -> None:
+    dense = np.ones((63, 63), dtype=np.uint8)
+    sparse = np.zeros_like(dense)
+    sparse[::2, ::2] = 1
+    sparse[27:36, 27:36] = 1
+    for valid in (dense, sparse):
+        valid[29:34, 29:34] = 0
+    dense_mask = _build_small_hole_mask(
+        dense, tmp_path / "dense.npy", 0.005, 0.0075, CancellationToken(), adaptive=True,
+    )
+    sparse_mask = _build_small_hole_mask(
+        sparse, tmp_path / "sparse.npy", 0.005, 0.0075, CancellationToken(), adaptive=True,
+    )
+    capped_mask = _build_small_hole_mask(
+        sparse, tmp_path / "capped.npy", 0.005, 0.0075, CancellationToken(),
+        adaptive=True, adaptive_limit_m=0.01,
+    )
+    assert not dense_mask[31, 31]
+    assert sparse_mask[31, 31]
+    assert not capped_mask[31, 31]
+    for mask in (dense_mask, sparse_mask, capped_mask):
+        _close(mask)
+
+
+def test_adaptive_holes_respect_area_and_zero_disables_all_fills(tmp_path: Path) -> None:
+    valid = np.ones((31, 31), dtype=np.uint8)
+    valid[10:13, 10:13] = 0
+    for name, distance, area in (("area", 0.0075, 8), ("disabled", 0, 25)):
+        mask = _build_small_hole_mask(
+            valid, tmp_path / f"{name}.npy", 0.005, distance, CancellationToken(),
+            adaptive=True, maximum_hole_area_pixels=area, allow_scanline_gaps=True,
+        )
+        assert not np.any(mask)
+        _close(mask)
+
+
+def test_idw_fills_from_multiple_samples_without_changing_observations():
+    rr, cc = np.indices((9, 9))
+    field = ((rr + cc) / 16.0).astype(np.float32)
+    field[4, 4] = np.nan
+    before = field.copy()
+    mask = np.zeros(field.shape, dtype=np.uint8)
+    mask[4, 4] = 1
+    display, _ = _build_display_raster(
+        field, mask, (0, 1), 0.005, 0.015, CancellationToken(), False,
+        interpolation_method="idw",
+    )
+    assert display[4, 4] == 128
+    assert mask[4, 4] == 1
+    assert np.array_equal(field, before, equal_nan=True)
+    valid = np.isfinite(field)
+    assert np.array_equal(display[valid], np.rint(field[valid] * 255).astype(np.uint8))
+
+
+def test_idw_rejects_depth_and_intensity_edges_and_records_actual_fills():
+    for use_depth in (False, True):
+        field = np.full((9, 9), 0.5, dtype=np.float32)
+        depth = np.zeros_like(field)
+        if use_depth:
+            depth[:, 5:] = 0.3
+        else:
+            field[:, 5:] = 1
+        field[4, 4] = np.nan
+        mask = np.zeros(field.shape, dtype=np.uint8)
+        mask[4, 4] = 1
+        display, _ = _build_display_raster(
+            field, mask, (0, 1), 0.005, 0.015, CancellationToken(), False,
+            depth if use_depth else None, interpolation_method="idw",
+        )
+        assert display[4, 4] == 0
+        assert mask[4, 4] == 0
+
+
+def test_idw_keeps_scanline_linear_and_does_not_fallback_across_edges(tmp_path: Path) -> None:
+    for strong_edge in (False, True):
+        field = np.tile(np.linspace(0, 1, 9, dtype=np.float32), (9, 1))
+        if strong_edge:
+            field[:, :4] = 0
+            field[:, 5:] = 1
+        field[:, 4] = np.nan
+        mask = _build_small_hole_mask(
+            np.isfinite(field), tmp_path / f"gap-{strong_edge}.npy", 0.005, 0.0075,
+            CancellationToken(), allow_scanline_gaps=True, adaptive=True,
+        )
+        display, _ = _build_display_raster(
+            field, mask, (0, 1), 0.005, 0.015, CancellationToken(), False,
+            interpolation_method="idw",
+        )
+        assert np.all(display[:, 4] == (0 if strong_edge else 128))
+        assert np.all(mask[:, 4] == (0 if strong_edge else 1))
+        _close(mask)
+
+
+def test_adaptive_tile_halos_match_single_tile(tmp_path: Path, monkeypatch) -> None:
+    import ortho_generator.service as service
+
+    rr, cc = np.indices((65, 65))
+    field = (0.3 + rr * 0.003 + cc * 0.005).astype(np.float32)
+    field[12:15, 16:19] = np.nan
+    field[35:38, 33:36] = np.nan
+    field[13] = np.nan
+    field[12, 25] = np.nan
+    field[39] = np.nan
+    def build(name):
+        mask = _build_small_hole_mask(
+            np.isfinite(field), tmp_path / f"{name}.npy", 0.005, 0.0075,
+            CancellationToken(), adaptive=True, allow_scanrow_gaps=True,
+        )
+        display, _ = _build_display_raster(
+            field, mask, (0, 1), 0.005, 0.015, CancellationToken(), False,
+            interpolation_method="idw", allow_scanrow_gaps=True,
+        )
+        result = display.copy(), np.asarray(mask).copy()
+        _close(mask)
+        return result
+    expected = build("single")
+    original_tiles = service._tiles
+    monkeypatch.setattr(service, "_tiles", lambda shape: original_tiles(shape, 13, 17))
+    actual = build("tiled")
+    assert all(np.array_equal(a, b) for a, b in zip(expected, actual))
+
+
+def test_coverage_distinguishes_observed_dark_filled_and_missing():
+    from ortho_generator.service import _coverage_preview, _display_coverage
+
+    field = np.array([[0, 0.5, np.nan, np.nan]], dtype=np.float32)
+    hits = np.array([[1, 4, 0, 0]], dtype=np.uint32)
+    interpolation = np.array([[0, 0, 1, 0]], dtype=np.uint8)
+    token = CancellationToken()
+    stats = _display_coverage(field, hits, interpolation, 0.005, token)
+    assert stats["observed_pixel_count"] == 2
+    assert stats["interpolated_pixel_count"] == 1
+    assert stats["remaining_missing_pixel_count"] == 1
+    assert stats["single_hit_pixel_count"] == 1
+    assert stats["observed_fraction"] == 0.5
+    colors = np.asarray(_coverage_preview(field, interpolation, (0, 1), token).convert("RGB"))
+    assert colors.tolist() == [[[0, 0, 0], [180, 180, 180], [0, 150, 255], [255, 70, 70]]]
+
+
+def test_adaptive_rebuild_is_reproducible_and_preserves_scientific_files(tmp_path: Path) -> None:
+    import json
+    import runpy
+
+    field = np.full((31, 31), 0.5, dtype=np.float32)
+    field[10:13, 10:13] = np.nan
+    field[20:26, 20:26] = np.nan
+    hits = np.isfinite(field).astype(np.uint32)
+    np.save(tmp_path / "intensity.npy", field)
+    np.save(tmp_path / "hit_count.npy", hits)
+    Image.fromarray(hits.astype(np.uint8)).save(tmp_path / "observed_mask.png")
+    Image.fromarray(np.zeros(field.shape, dtype=np.uint8)).save(tmp_path / "image.png")
+    metadata = {
+        "image": "image.png", "shape": list(field.shape), "pixel_size_m": 0.005,
+        "source_point_cloud": "test.e57", "display": {"minimum": 0, "maximum": 1},
+        "display_impulse_suppression": {"enabled": False},
+    }
+    (tmp_path / "image.json").write_text(json.dumps(metadata), encoding="utf-8")
+    scientific_names = ("intensity.npy", "hit_count.npy", "observed_mask.png")
+    before = {name: (tmp_path / name).read_bytes() for name in scientific_names}
+    rebuild = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools" / "rebuild_existing_display.py"))["rebuild"]
+    count = rebuild(tmp_path, 0.01, adaptive=True, interpolation_method="idw")
+    assert count == 9
+    expected = (tmp_path / "image.png").read_bytes()
+    saved = json.loads((tmp_path / "image.json").read_text(encoding="utf-8"))
+    assert saved["display_interpolation"]["interpolation_method"] == "idw"
+    assert saved["display_coverage"]["remaining_missing_pixel_count"] == 36
+    assert (tmp_path / "coverage_preview.png").is_file()
+    assert rebuild(tmp_path) == count
+    assert (tmp_path / "image.png").read_bytes() == expected
+    assert all((tmp_path / name).read_bytes() == data for name, data in before.items())
+
+
+def test_interpolation_settings_reject_invalid_limits():
+    import pytest
+
+    for kwargs in (
+        {"adaptive_display_interpolation_limit_m": -1},
+        {"adaptive_display_interpolation_limit_m": np.nan},
+        {"adaptive_display_interpolation_limit_m": 0.001},
+        {"maximum_display_hole_area_pixels": 0},
+        {"display_interpolation_method": "cubic"},
+    ):
+        with pytest.raises(ValueError):
+            GenerationSettings(**kwargs).validate()
+    GenerationSettings(maximum_display_interpolation_distance_m=0).validate()
 
 
 def test_display_suppresses_only_isolated_extreme_pixels() -> None:
@@ -626,6 +966,130 @@ class StructuredSyntheticSource(SyntheticSource):
             end = min(len(self.x), start + 500)
             yield PointBatch(self.x[start:end], self.y[start:end], self.z[start:end],
                              self.intensity[start:end], self.rows[start:end], self.columns[start:end])
+
+
+class SparseStructuredSyntheticSource(StructuredSyntheticSource):
+    def __init__(self, path):
+        angles = np.linspace(-np.pi / 3, 4 * np.pi / 3, 1024)
+        dx, dz = np.cos(angles), np.sin(angles)
+        center_x, center_z, radius = 0.45, 0.18, 1.2
+        projection = center_x * dx + center_z * dz
+        distance = projection + np.sqrt(projection**2 + radius**2 - center_x**2 - center_z**2)
+        self.x = np.tile(distance * dx, 17)
+        self.z = np.tile(distance * dz, 17)
+        self.columns = np.repeat(np.arange(17, dtype=np.uint32), len(angles))
+        self.y = self.columns.astype(np.float64)
+        self.rows = np.tile(np.arange(len(angles), dtype=np.uint32), 17)
+        self.intensity = np.full(len(self.x), 0.6, dtype=np.float64)
+        self.meta = PointCloudMetadata(str(path), "E57", len(self.x), 1,
+                                       "intensity", len(angles), 17, True)
+
+
+class StructuredDropoutSource(SparseStructuredSyntheticSource):
+    def __init__(self, path):
+        super().__init__(path)
+        contour = np.column_stack((self.x[:1024], self.z[:1024]))
+        arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(contour, axis=0), axis=1))]
+        output_rows = np.floor(arc / 0.005).astype(int)
+        target = output_rows[512]
+        self.intensity = np.where(self.columns < 8, 0.35, 0.9)
+        keep = ~(
+            np.isin(output_rows[self.rows], [target, target + 1])
+            & np.isin(self.columns, [8, 9])
+        )
+        for name in ("x", "y", "z", "rows", "columns", "intensity"):
+            setattr(self, name, getattr(self, name)[keep])
+        self.meta = PointCloudMetadata(str(path), "E57", len(self.x), 1,
+                                       "intensity", 1024, 17, True)
+
+
+def test_generation_runs_dark_speckle_repair_and_rebuild_can_disable_it(tmp_path: Path) -> None:
+    import json
+    import runpy
+
+    path = tmp_path / "dropouts.e57"
+    path.touch()
+    results = []
+    for enabled in (False, True):
+        results.append(generate_orthophotos(
+            path, tmp_path / f"out-{enabled}",
+            GenerationSettings(pixel_size_m=0.005, expected_diameter_m=2.4,
+                               fit_sample_count=2000, structured_scan_span_degrees=300,
+                               vehicle_speed_mps=1.0, scanner_revolutions_per_second=200,
+                               display_min=0.0, display_max=1.0,
+                               repair_display_dark_speckles=enabled,
+                               output_auxiliary_data=True, flat_image_output=False),
+            source_factory=StructuredDropoutSource,
+        ))
+    baseline, fixed = results
+    before_image = np.asarray(Image.open(baseline.image_paths[0]))
+    image = np.asarray(Image.open(fixed.image_paths[0]))
+    directory = Path(fixed.output_directory) / "auxiliary" / "ORTHO_00001"
+    mask = np.asarray(Image.open(directory / "display_dark_speckle_mask.png"))
+    assert np.count_nonzero(mask) >= 2
+    assert np.all(image[mask > 0] > before_image[mask > 0])
+    assert np.array_equal(image[mask == 0], before_image[mask == 0])
+    hits = np.load(directory / "hit_count.npy")
+    assert not np.any(hits[mask > 0])
+    interpolated = np.asarray(Image.open(directory / "interpolated_mask.png"))
+    assert np.all(interpolated[mask > 0] == 1)
+    metadata = json.loads((directory / "image.json").read_text(encoding="utf-8"))
+    manifest = json.loads(Path(fixed.manifest_path).read_text(encoding="utf-8"))
+    assert metadata["display_dark_speckle_repair"]["modified_pixel_count"] == int(np.count_nonzero(mask))
+    assert manifest["display_dark_speckle_repair"][0]["enabled"] is True
+    science_names = ("intensity.npy", "hit_count.npy", "observed_mask.png")
+    science_before = {name: (directory / name).read_bytes() for name in science_names}
+    expected_image = Path(fixed.image_paths[0]).read_bytes()
+    rebuild = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools" / "rebuild_existing_display.py"))["rebuild"]
+    rebuild(directory)
+    assert Path(fixed.image_paths[0]).read_bytes() == expected_image
+    rebuild(directory, repair_dark_speckles=False)
+    assert np.array_equal(np.asarray(Image.open(fixed.image_paths[0])), before_image)
+    assert not (directory / "display_dark_speckle_mask.png").exists()
+    assert all((directory / name).read_bytes() == science_before[name] for name in science_names)
+
+
+def test_structured_generation_removes_rasterization_rows_and_rebuilds_identically(tmp_path: Path) -> None:
+    import json
+    import runpy
+
+    path = tmp_path / "sparse-structured.e57"
+    path.touch()
+    result = generate_orthophotos(
+        path, tmp_path / "out",
+        GenerationSettings(pixel_size_m=0.005, expected_diameter_m=2.4,
+                           fit_sample_count=2000, structured_scan_span_degrees=300,
+                           vehicle_speed_mps=1.0, scanner_revolutions_per_second=200,
+                           display_min=0.0, display_max=1.0,
+                           output_auxiliary_data=True, flat_image_output=False),
+        source_factory=SparseStructuredSyntheticSource,
+    )
+    directory = Path(result.output_directory) / "auxiliary" / "ORTHO_00001"
+    hits = np.load(directory / "hit_count.npy")
+    manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["display_scanrow_resampling"]["enabled"] is True
+    empty_rows = np.flatnonzero(~np.any(hits, axis=1))
+    empty_rows = empty_rows[(empty_rows > 0) & (empty_rows < hits.shape[0] - 1)]
+    assert len(empty_rows) > 100
+    display = np.asarray(Image.open(result.image_paths[0]))
+    assert np.all(display[empty_rows] == 153)
+    scientific = np.load(directory / "intensity.npy")
+    assert np.all(np.isnan(scientific[empty_rows]))
+    mask = np.asarray(Image.open(directory / "interpolated_mask.png"))
+    assert np.all(mask[empty_rows] == 1)
+    metadata_path = directory / "image.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["display_interpolation"]["allow_scanrow_gaps"] is True
+    # Old auxiliary outputs infer the fix from their structured run manifest.
+    metadata["display_interpolation"].pop("allow_scanrow_gaps")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    science_names = ("intensity.npy", "hit_count.npy", "observed_mask.png")
+    before = {name: (directory / name).read_bytes() for name in science_names}
+    image_before = Path(result.image_paths[0]).read_bytes()
+    rebuild = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools" / "rebuild_existing_display.py"))["rebuild"]
+    rebuild(directory)
+    assert Path(result.image_paths[0]).read_bytes() == image_before
+    assert all((directory / name).read_bytes() == before[name] for name in science_names)
 
 
 def test_structured_e57_does_not_enter_las_depth_path(tmp_path: Path) -> None:
